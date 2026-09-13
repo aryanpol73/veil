@@ -62,10 +62,6 @@ export const expoSqliteDriver: SqlDriver = {
       },
     };
   },
-
-  exists(_targetName: string): boolean {
-    return false;
-  },
 };
 
 /* -------------------------------------------------------------------------- */
@@ -77,6 +73,7 @@ interface MemoryDbState {
   masks: Map<number, any>;
   contacts: Map<string, any>;
   threads: Map<string, any>;
+  ratchets: Map<string, any>;
   messages: Map<string, any>;
   ballast: any[];
   pageCount: number;
@@ -92,6 +89,7 @@ function getOrCreateMemoryDb(name: string): MemoryDbState {
       masks: new Map(),
       contacts: new Map(),
       threads: new Map(),
+      ratchets: new Map(),
       messages: new Map(),
       ballast: [],
       pageCount: 16,
@@ -210,7 +208,29 @@ export const memoryDriver: SqlDriver = {
           return { rows: [], rowsAffected: 1 };
         }
 
-        // 8. messages table
+        // 8. ratchets table
+        if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+ratchets/i.test(trimmed)) {
+          mem.ratchets.set(params[0], {
+            thread_id: params[0],
+            root_key: params[1],
+            send_chain_key: params[2],
+            recv_chain_key: params[3],
+            send_dh_sk: params[4],
+            send_dh_pk: params[5],
+            recv_dh_pk: params[6],
+            send_counter: params[7],
+            recv_counter: params[8],
+            prev_chain_len: params[9],
+          });
+          return { rows: [], rowsAffected: 1 };
+        }
+
+        if (/SELECT\s+\*\s+FROM\s+ratchets\s+WHERE\s+thread_id\s*=\s*\?/i.test(trimmed)) {
+          const r = mem.ratchets.get(params[0]);
+          return { rows: r ? ([r] as any) : [], rowsAffected: 0 };
+        }
+
+        // 9. messages table
         if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+messages/i.test(trimmed)) {
           const isDecoy = /delivered_at/i.test(trimmed);
           if (isDecoy) {
@@ -336,10 +356,6 @@ export const memoryDriver: SqlDriver = {
         memoryStore.delete(name);
       },
     };
-  },
-
-  exists(targetName: string): boolean {
-    return memoryStore.has(targetName);
   },
 };
 

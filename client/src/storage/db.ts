@@ -80,8 +80,6 @@ export interface SqlConnection {
 export interface SqlDriver {
   /** Opens (or creates) a database file. */
   open(name: string): SqlConnection;
-  /** True if the file already exists on disk. */
-  exists?(name: string): boolean;
 }
 
 let driver: SqlDriver = defaultDriver;
@@ -176,13 +174,13 @@ CREATE TABLE IF NOT EXISTS threads (
   unread_count       INTEGER NOT NULL DEFAULT 0
 );
 
--- Ratchet state. Encrypted at rest; keys are held only as long as needed.
+-- Ratchet state. Sensitive ratchet secrets (root_key, send/recv chain keys, send_dh_sk) are sealed with AEAD at application layer using the active vault key.
 CREATE TABLE IF NOT EXISTS ratchets (
   thread_id        TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-  root_key         BLOB NOT NULL,
-  send_chain_key   BLOB,
-  recv_chain_key   BLOB,
-  send_dh_sk       BLOB NOT NULL,
+  root_key         TEXT NOT NULL,
+  send_chain_key   TEXT,
+  recv_chain_key   TEXT,
+  send_dh_sk       TEXT NOT NULL,
   send_dh_pk       BLOB NOT NULL,
   recv_dh_pk       BLOB,
   send_counter     INTEGER NOT NULL DEFAULT 0,
@@ -332,18 +330,38 @@ function tryOpen(partition: Partition, rawKey: Uint8Array): SqlConnection | null
   }
 }
 
+/**
+ * Splits a multi-statement SQL script into individual executable statements.
+ *
+ * WHY NAIVE SPLIT IS UNSAFE:
+ * Naively calling `SCHEMA.split(';')` breaks when any comment or literal
+ * contains a semicolon (e.g. `-- Ratchet state. Encrypted at rest; keys...`).
+ * The fragment immediately following the semicolon will no longer be treated
+ * as a comment by the SQLite engine, causing a syntax error that aborts and
+ * rolls back the entire `migrate()` transaction on native platforms.
+ *
+ * Stripping `--` line comments prior to splitting on semicolons guarantees
+ * that semicolons inside comments cannot divide SQL statements.
+ */
+export function splitSqlStatements(sql: string): string[] {
+  return sql
+    .replace(/--[^\r\n]*/g, '')
+    .split(';')
+    .map((stmt) => stmt.trim())
+    .filter((stmt) => stmt.length > 0);
+}
+
 function migrate(conn: SqlConnection): void {
   conn.transaction(() => {
-    for (const stmt of SCHEMA.split(';')) {
-      const sql = stmt.trim();
-      if (sql) conn.execute(sql);
+    for (const sql of splitSqlStatements(SCHEMA)) {
+      conn.execute(sql);
     }
     conn.execute('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)', ['schema_version', '1']);
   });
 }
 
 /* -------------------------------------------------------------------------- */
-/* Message Body Sealing Helpers                                               */
+/* Message Body & Ratchet Sealing Helpers                                     */
 /* -------------------------------------------------------------------------- */
 
 function openMessageBody(vaultKey: Uint8Array, id: string, storedBody: string): string {
@@ -359,6 +377,129 @@ function openMessageBody(vaultKey: Uint8Array, id: string, storedBody: string): 
   } catch {
     return '[unreadable]';
   }
+}
+
+export interface RatchetState {
+  rootKey: Uint8Array;
+  sendChainKey: Uint8Array | null;
+  recvChainKey: Uint8Array | null;
+  sendDhSk: Uint8Array;
+  sendDhPk: Uint8Array;
+  recvDhPk: Uint8Array | null;
+  sendCounter: number;
+  recvCounter: number;
+  prevChainLen: number;
+  root_key?: Uint8Array;
+  send_chain_key?: Uint8Array | null;
+  recv_chain_key?: Uint8Array | null;
+  send_dh_sk?: Uint8Array;
+  send_dh_pk?: Uint8Array;
+  recv_dh_pk?: Uint8Array | null;
+  send_counter?: number;
+  recv_counter?: number;
+  prev_chain_len?: number;
+}
+
+function sealBlob(
+  field: string,
+  threadId: string,
+  bytes: Uint8Array | null | undefined,
+): string | null {
+  if (!bytes) return null;
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  const aad = utf8(`ratchet|${threadId}|${field}`);
+  const sealed = aeadEncrypt(active.vaultKey, bytes, aad);
+  return packSealed(sealed);
+}
+
+function openBlob(
+  field: string,
+  threadId: string,
+  stored: string | null | undefined,
+): Uint8Array | null {
+  if (!stored) return null;
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  const sealed = unpackSealed(stored);
+  if (!sealed) return null;
+  const aad = utf8(`ratchet|${threadId}|${field}`);
+  return aeadDecrypt(active.vaultKey, sealed, aad);
+}
+
+export function saveRatchet(threadId: string, state: RatchetState): void {
+  const db = getDb();
+  const rootKey = state.rootKey ?? state.root_key;
+  if (!rootKey) throw new Error('[veil/db] rootKey is required to save ratchet.');
+  const sendChainKey =
+    state.sendChainKey !== undefined ? state.sendChainKey : (state.send_chain_key ?? null);
+  const recvChainKey =
+    state.recvChainKey !== undefined ? state.recvChainKey : (state.recv_chain_key ?? null);
+  const sendDhSk = state.sendDhSk ?? state.send_dh_sk;
+  if (!sendDhSk) throw new Error('[veil/db] sendDhSk is required to save ratchet.');
+  const sendDhPk = state.sendDhPk ?? state.send_dh_pk;
+  if (!sendDhPk) throw new Error('[veil/db] sendDhPk is required to save ratchet.');
+  const recvDhPk =
+    state.recvDhPk !== undefined ? state.recvDhPk : (state.recv_dh_pk ?? null);
+  const sendCounter = state.sendCounter ?? state.send_counter ?? 0;
+  const recvCounter = state.recvCounter ?? state.recv_counter ?? 0;
+  const prevChainLen = state.prevChainLen ?? state.prev_chain_len ?? 0;
+
+  const sealedRoot = sealBlob('root_key', threadId, rootKey);
+  const sealedSendChain = sealBlob('send_chain_key', threadId, sendChainKey);
+  const sealedRecvChain = sealBlob('recv_chain_key', threadId, recvChainKey);
+  const sealedSendDhSk = sealBlob('send_dh_sk', threadId, sendDhSk);
+
+  db.execute(
+    `INSERT OR REPLACE INTO ratchets
+     (thread_id, root_key, send_chain_key, recv_chain_key, send_dh_sk, send_dh_pk, recv_dh_pk, send_counter, recv_counter, prev_chain_len)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [
+      threadId,
+      sealedRoot,
+      sealedSendChain,
+      sealedRecvChain,
+      sealedSendDhSk,
+      sendDhPk,
+      recvDhPk,
+      sendCounter,
+      recvCounter,
+      prevChainLen,
+    ],
+  );
+}
+
+export function loadRatchet(threadId: string): RatchetState | null {
+  const db = getDb();
+  const rows = db.execute<any>('SELECT * FROM ratchets WHERE thread_id = ?', [threadId]).rows;
+  if (!rows || rows.length === 0) return null;
+  const row = rows[0];
+
+  const rootKey = openBlob('root_key', threadId, row.root_key);
+  if (!rootKey) return null;
+  const sendChainKey = openBlob('send_chain_key', threadId, row.send_chain_key);
+  const recvChainKey = openBlob('recv_chain_key', threadId, row.recv_chain_key);
+  const sendDhSk = openBlob('send_dh_sk', threadId, row.send_dh_sk);
+  if (!sendDhSk) return null;
+
+  return {
+    rootKey,
+    root_key: rootKey,
+    sendChainKey,
+    send_chain_key: sendChainKey,
+    recvChainKey,
+    recv_chain_key: recvChainKey,
+    sendDhSk,
+    send_dh_sk: sendDhSk,
+    sendDhPk: row.send_dh_pk,
+    send_dh_pk: row.send_dh_pk,
+    recvDhPk: row.recv_dh_pk,
+    recv_dh_pk: row.recv_dh_pk,
+    sendCounter: row.send_counter ?? 0,
+    send_counter: row.send_counter ?? 0,
+    recvCounter: row.recv_counter ?? 0,
+    recv_counter: row.recv_counter ?? 0,
+    prevChainLen: row.prev_chain_len ?? 0,
+    prev_chain_len: row.prev_chain_len ?? 0,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -602,6 +743,8 @@ export async function lockVault(): Promise<void> {
   if (active) {
     try {
       active.db.execute('PRAGMA incremental_vacuum');
+      // Truncate the WAL file so deleted pages don't survive in slack space
+      active.db.execute('PRAGMA wal_checkpoint(TRUNCATE)');
       active.db.close();
     } catch {
       /* closing a dying handle is not actionable */
@@ -768,7 +911,6 @@ export function markReadAndArmTtl(id: string): void {
   const db = getDb();
   const row = db.execute<StoredMessage>('SELECT * FROM messages WHERE id = ?', [id]).rows[0];
   if (!row || row.read_at) return;
-  openMessageBody(active.vaultKey, row.id, row.body);
   const now = Date.now();
   db.execute('UPDATE messages SET read_at = ?, expires_at = ? WHERE id = ?', [
     now,
@@ -789,7 +931,19 @@ export function sweepExpired(): number {
       Date.now(),
     ]).rowsAffected;
   });
-  if (removed > 0) db.execute('PRAGMA incremental_vacuum');
+  if (removed > 0) {
+    db.execute('PRAGMA incremental_vacuum');
+    /**
+     * WAL VS TTL TRADEOFF:
+     * We retain `journal_mode = WAL` because WAL is necessary for concurrent reads during
+     * background TTL sweeps. However, SQLite WAL mode retains deleted pages inside the `-wal`
+     * file until a checkpoint occurs, allowing swept timed messages to persist on disk.
+     * To solve this without sacrificing read concurrency, we run `PRAGMA wal_checkpoint(TRUNCATE)`
+     * immediately after every sweep deletion and inside `lockVault()`. This flushes and truncates
+     * the `-wal` file to zero bytes, guaranteeing that deleted messages do not linger in the WAL.
+     */
+    db.execute('PRAGMA wal_checkpoint(TRUNCATE)');
+  }
   removed += RamVault.sweep();
   return removed;
 }
@@ -897,4 +1051,6 @@ export default {
   panicWipe,
   RamVault,
   setSqlDriver,
+  saveRatchet,
+  loadRatchet,
 };

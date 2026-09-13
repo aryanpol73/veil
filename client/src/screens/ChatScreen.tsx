@@ -48,7 +48,7 @@ import Animated, {
   type SharedValue,
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import HapticFeedback from 'react-native-haptic-feedback';
+import * as Haptics from 'expo-haptics';
 
 import {
   Blur,
@@ -75,8 +75,44 @@ import {
   type StoredMessage,
 } from '../storage/db';
 
-const haptic = (type: Parameters<typeof HapticFeedback.trigger>[0]) =>
-  HapticFeedback.trigger(type, { enableVibrateFallback: true, ignoreAndroidSystemSettings: false });
+type HapticType =
+  | 'impactLight'
+  | 'impactMedium'
+  | 'impactHeavy'
+  | 'selection'
+  | 'notificationSuccess'
+  | 'notificationWarning'
+  | 'notificationError';
+
+const haptic = (type: HapticType) => {
+  try {
+    switch (type) {
+      case 'impactLight':
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+        break;
+      case 'impactMedium':
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+        break;
+      case 'impactHeavy':
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {});
+        break;
+      case 'selection':
+        Haptics.selectionAsync().catch(() => {});
+        break;
+      case 'notificationSuccess':
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        break;
+      case 'notificationWarning':
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+        break;
+      case 'notificationError':
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+        break;
+    }
+  } catch {
+    /* ignore unsupported device errors */
+  }
+};
 
 /* ========================================================================== */
 /* Backdrop                                                                   */

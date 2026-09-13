@@ -49,7 +49,7 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import * as ScreenCapture from 'expo-screen-capture';
-import HapticFeedback from 'react-native-haptic-feedback';
+import * as Haptics from 'expo-haptics';
 import { watermarkTag, toB64 } from '../crypto/keys';
 import { Palette, withAlpha } from '../theme/obsidianPrism';
 
@@ -239,10 +239,7 @@ export const DynamicWatermark: React.FC<DynamicWatermarkProps> = ({
       );
       if (Platform.OS !== 'web') {
         try {
-          HapticFeedback.trigger('notificationWarning', {
-            enableVibrateFallback: true,
-            ignoreAndroidSystemSettings: false,
-          });
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
         } catch {
           /* ignore */
         }

@@ -25,3 +25,7 @@ web-build/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Local native config & scratch files
+client/android/local.properties
+scratch/*.mjs
