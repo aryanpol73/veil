@@ -24,7 +24,12 @@ export const expoSqliteDriver: SqlDriver = {
     if (!isNative || !SQLite) {
       return memoryDriver.open(name);
     }
-    const db = SQLite.openDatabaseSync(name);
+    let db: any;
+    try {
+      db = SQLite.openDatabaseSync(name, { useSQLCipher: true });
+    } catch {
+      db = SQLite.openDatabaseSync(name);
+    }
 
     return {
       execute<T = any>(sql: string, params: any[] = []): SqlResult<T> {
@@ -179,6 +184,7 @@ export const memoryDriver: SqlDriver = {
 
         // 6. contacts table
         if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+contacts/i.test(trimmed)) {
+          const hasFpTag = params.length >= 9;
           mem.contacts.set(params[0], {
             id: params[0],
             mask_index: params[1],
@@ -186,8 +192,9 @@ export const memoryDriver: SqlDriver = {
             sign_pk: params[3],
             dh_pk: params[4],
             fingerprint: params[5],
-            verified_at: params[6],
-            created_at: params[7],
+            fp_tag: hasFpTag ? params[6] : undefined,
+            verified_at: hasFpTag ? params[7] : params[6],
+            created_at: hasFpTag ? params[8] : params[7],
           });
           return { rows: [], rowsAffected: 1 };
         }
@@ -197,8 +204,10 @@ export const memoryDriver: SqlDriver = {
           return { rows: c ? ([c] as any) : [], rowsAffected: 0 };
         }
 
-        if (/SELECT\s+\*\s+FROM\s+contacts\s+WHERE\s+fingerprint\s*=\s*\?/i.test(trimmed)) {
-          const matched = [...mem.contacts.values()].filter((c) => c.fingerprint === params[0]);
+        if (/SELECT\s+\*\s+FROM\s+contacts\s+WHERE\s+(fp_tag|fingerprint)\s*=\s*\?/i.test(trimmed)) {
+          const matched = [...mem.contacts.values()].filter(
+            (c) => c.fp_tag === params[0] || c.fingerprint === params[0],
+          );
           return { rows: matched as any, rowsAffected: 0 };
         }
 
@@ -268,6 +277,7 @@ export const memoryDriver: SqlDriver = {
             send_counter: params[7],
             recv_counter: params[8],
             prev_chain_len: params[9],
+            skipped_keys: params[10],
           });
           return { rows: [], rowsAffected: 1 };
         }

@@ -41,6 +41,8 @@ import {
   randomBytes,
   toB64,
   fromB64,
+  toHex,
+  deriveSubSeed,
   wipe,
   aeadEncrypt,
   aeadDecrypt,
@@ -145,6 +147,7 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 
+-- Masks metadata. Label and fingerprint are sealed with AEAD using the partition key.
 CREATE TABLE IF NOT EXISTS masks (
   mask_index   INTEGER PRIMARY KEY NOT NULL,
   label        TEXT NOT NULL,
@@ -152,16 +155,21 @@ CREATE TABLE IF NOT EXISTS masks (
   created_at   INTEGER NOT NULL
 );
 
+-- Contacts table. All sensitive fields (alias, sign_pk, dh_pk, fingerprint) are sealed with AEAD
+-- using the active vault key at the application layer. fp_tag provides a deterministic keyed blind index.
 CREATE TABLE IF NOT EXISTS contacts (
   id           TEXT PRIMARY KEY NOT NULL,
   mask_index   INTEGER NOT NULL,
   alias        TEXT NOT NULL,
-  sign_pk      BLOB NOT NULL,
-  dh_pk        BLOB NOT NULL,
+  sign_pk      TEXT NOT NULL,
+  dh_pk        TEXT NOT NULL,
   fingerprint  TEXT NOT NULL,
+  fp_tag       TEXT,
   verified_at  INTEGER,
   created_at   INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_contacts_fp_tag ON contacts(fp_tag);
 
 CREATE TABLE IF NOT EXISTS threads (
   id                 TEXT PRIMARY KEY NOT NULL,
@@ -171,18 +179,19 @@ CREATE TABLE IF NOT EXISTS threads (
   unread_count       INTEGER NOT NULL DEFAULT 0
 );
 
--- Ratchet state. Sensitive ratchet secrets (root_key, send/recv chain keys, send_dh_sk) are sealed with AEAD at application layer using the active vault key.
+-- Ratchet state. Sensitive ratchet secrets and DH keys are sealed with AEAD at application layer using the active vault key.
 CREATE TABLE IF NOT EXISTS ratchets (
   thread_id        TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   root_key         TEXT NOT NULL,
   send_chain_key   TEXT,
   recv_chain_key   TEXT,
   send_dh_sk       TEXT NOT NULL,
-  send_dh_pk       BLOB NOT NULL,
-  recv_dh_pk       BLOB,
+  send_dh_pk       TEXT NOT NULL,
+  recv_dh_pk       TEXT,
   send_counter     INTEGER NOT NULL DEFAULT 0,
   recv_counter     INTEGER NOT NULL DEFAULT 0,
-  prev_chain_len   INTEGER NOT NULL DEFAULT 0
+  prev_chain_len   INTEGER NOT NULL DEFAULT 0,
+  skipped_keys     TEXT
 );
 
 -- Persistent and Timed messages only. View-Once NEVER reaches this table;
@@ -353,6 +362,16 @@ function migrate(conn: SqlConnection): void {
     for (const sql of splitSqlStatements(SCHEMA)) {
       conn.execute(sql);
     }
+    try {
+      conn.execute('ALTER TABLE contacts ADD COLUMN fp_tag TEXT');
+    } catch {
+      /* ignore if column exists */
+    }
+    try {
+      conn.execute('ALTER TABLE ratchets ADD COLUMN skipped_keys TEXT');
+    } catch {
+      /* ignore if column exists */
+    }
     conn.execute('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)', ['schema_version', '1']);
   });
 }
@@ -376,6 +395,14 @@ function openMessageBody(vaultKey: Uint8Array, id: string, storedBody: string): 
   }
 }
 
+export interface StoredSkippedKey {
+  id: string;
+  remoteDhPkHex?: string;
+  counter: number;
+  messageKey: Uint8Array;
+  createdAt: number;
+}
+
 export interface RatchetState {
   rootKey: Uint8Array;
   sendChainKey: Uint8Array | null;
@@ -386,6 +413,7 @@ export interface RatchetState {
   sendCounter: number;
   recvCounter: number;
   prevChainLen: number;
+  skippedKeys?: StoredSkippedKey[];
   root_key?: Uint8Array;
   send_chain_key?: Uint8Array | null;
   recv_chain_key?: Uint8Array | null;
@@ -395,6 +423,7 @@ export interface RatchetState {
   send_counter?: number;
   recv_counter?: number;
   prev_chain_len?: number;
+  skipped_keys?: StoredSkippedKey[];
 }
 
 function sealBlob(
@@ -444,22 +473,40 @@ export function saveRatchet(threadId: string, state: RatchetState): void {
   const sealedSendChain = sealBlob('send_chain_key', threadId, sendChainKey);
   const sealedRecvChain = sealBlob('recv_chain_key', threadId, recvChainKey);
   const sealedSendDhSk = sealBlob('send_dh_sk', threadId, sendDhSk);
+  const sealedSendDhPk = sealBlob('send_dh_pk', threadId, sendDhPk);
+  const sealedRecvDhPk = sealBlob('recv_dh_pk', threadId, recvDhPk);
+
+  let sealedSkippedKeys: string | null = null;
+  const skippedList = state.skippedKeys ?? state.skipped_keys;
+  if (skippedList && skippedList.length > 0) {
+    const raw = JSON.stringify(
+      skippedList.map((k) => ({
+        id: k.id,
+        remoteDhPkHex: k.remoteDhPkHex,
+        counter: k.counter,
+        messageKey: toB64(k.messageKey),
+        createdAt: k.createdAt,
+      })),
+    );
+    sealedSkippedKeys = sealBlob('skipped_keys', threadId, utf8(raw));
+  }
 
   db.execute(
     `INSERT OR REPLACE INTO ratchets
-     (thread_id, root_key, send_chain_key, recv_chain_key, send_dh_sk, send_dh_pk, recv_dh_pk, send_counter, recv_counter, prev_chain_len)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+     (thread_id, root_key, send_chain_key, recv_chain_key, send_dh_sk, send_dh_pk, recv_dh_pk, send_counter, recv_counter, prev_chain_len, skipped_keys)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     [
       threadId,
       sealedRoot,
       sealedSendChain,
       sealedRecvChain,
       sealedSendDhSk,
-      sendDhPk,
-      recvDhPk,
+      sealedSendDhPk,
+      sealedRecvDhPk,
       sendCounter,
       recvCounter,
       prevChainLen,
+      sealedSkippedKeys,
     ],
   );
 }
@@ -477,6 +524,38 @@ export function loadRatchet(threadId: string): RatchetState | null {
   const sendDhSk = openBlob('send_dh_sk', threadId, row.send_dh_sk);
   if (!sendDhSk) return null;
 
+  let sendDhPk = openBlob('send_dh_pk', threadId, row.send_dh_pk);
+  if (!sendDhPk && row.send_dh_pk) {
+    sendDhPk = row.send_dh_pk instanceof Uint8Array ? row.send_dh_pk : new Uint8Array(row.send_dh_pk);
+  }
+  if (!sendDhPk) return null;
+
+  let recvDhPk = openBlob('recv_dh_pk', threadId, row.recv_dh_pk);
+  if (!recvDhPk && row.recv_dh_pk) {
+    recvDhPk = row.recv_dh_pk instanceof Uint8Array ? row.recv_dh_pk : new Uint8Array(row.recv_dh_pk);
+  }
+
+  let skippedKeys: StoredSkippedKey[] = [];
+  if (row.skipped_keys) {
+    const pt = openBlob('skipped_keys', threadId, row.skipped_keys);
+    if (pt) {
+      try {
+        const parsed = JSON.parse(fromUtf8(pt));
+        if (Array.isArray(parsed)) {
+          skippedKeys = parsed.map((item: any) => ({
+            id: item.id,
+            remoteDhPkHex: item.remoteDhPkHex,
+            counter: item.counter,
+            messageKey: fromB64(item.messageKey),
+            createdAt: item.createdAt,
+          }));
+        }
+      } catch {
+        /* ignore corrupted skipped keys */
+      }
+    }
+  }
+
   return {
     rootKey,
     root_key: rootKey,
@@ -486,16 +565,18 @@ export function loadRatchet(threadId: string): RatchetState | null {
     recv_chain_key: recvChainKey,
     sendDhSk,
     send_dh_sk: sendDhSk,
-    sendDhPk: row.send_dh_pk,
-    send_dh_pk: row.send_dh_pk,
-    recvDhPk: row.recv_dh_pk,
-    recv_dh_pk: row.recv_dh_pk,
+    sendDhPk,
+    send_dh_pk: sendDhPk,
+    recvDhPk,
+    recv_dh_pk: recvDhPk,
     sendCounter: row.send_counter ?? 0,
     send_counter: row.send_counter ?? 0,
     recvCounter: row.recv_counter ?? 0,
     recv_counter: row.recv_counter ?? 0,
     prevChainLen: row.prev_chain_len ?? 0,
     prev_chain_len: row.prev_chain_len ?? 0,
+    skippedKeys,
+    skipped_keys: skippedKeys,
   };
 }
 
@@ -545,9 +626,15 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
       'canary',
       primaryCanary,
     ]);
+    const sealedPrimaryFp = packSealed(
+      aeadEncrypt(primaryKey, utf8(input.primaryFingerprint), utf8('mask|0|fp')),
+    );
+    const sealedPrimaryLabel = packSealed(
+      aeadEncrypt(primaryKey, utf8('Personal'), utf8('mask|0|label')),
+    );
     primary.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
-      [0, 'Personal', input.primaryFingerprint, Date.now()],
+      [0, sealedPrimaryLabel, sealedPrimaryFp, Date.now()],
     );
     primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'master_seed',
@@ -566,9 +653,15 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
       'canary',
       decoyCanary,
     ]);
+    const sealedGhostFp = packSealed(
+      aeadEncrypt(decoyKey, utf8(input.ghostFingerprint), utf8('mask|1|fp')),
+    );
+    const sealedGhostLabel = packSealed(
+      aeadEncrypt(decoyKey, utf8('Personal'), utf8('mask|1|label')),
+    );
     decoy.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
-      [1, 'Personal', input.ghostFingerprint, Date.now()],
+      [1, sealedGhostLabel, sealedGhostFp, Date.now()],
     );
     decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'master_seed',
@@ -624,6 +717,156 @@ export function isProvisioned(): boolean {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Contact Records (Encrypted at rest with AEAD + Blind Index Tag)            */
+/* -------------------------------------------------------------------------- */
+
+export interface StoredContactRecord {
+  id: string;
+  maskIndex: number;
+  alias: string;
+  signPk: Uint8Array;
+  dhPk: Uint8Array;
+  fingerprint: string;
+  verifiedAt: number | null;
+  createdAt: number;
+}
+
+export function computeContactFpTag(fingerprint: string, vaultKey?: Uint8Array): string {
+  const key = vaultKey ?? active?.vaultKey;
+  if (!key) throw new Error('[veil/db] vault is locked.');
+  return toHex(deriveSubSeed(key, `veil.contact.tag|${fingerprint}`, 16));
+}
+
+export function saveContactRow(
+  contact: StoredContactRecord,
+  customVaultKey?: Uint8Array,
+  customConn?: SqlConnection,
+): void {
+  const conn = customConn ?? getDb();
+  const key = customVaultKey ?? active?.vaultKey;
+  if (!key) throw new Error('[veil/db] vault is locked.');
+
+  const sealedAlias = packSealed(aeadEncrypt(key, utf8(contact.alias), utf8(`contact|${contact.id}|alias`)));
+  const sealedSignPk = packSealed(aeadEncrypt(key, contact.signPk, utf8(`contact|${contact.id}|sign_pk`)));
+  const sealedDhPk = packSealed(aeadEncrypt(key, contact.dhPk, utf8(`contact|${contact.id}|dh_pk`)));
+  const sealedFp = packSealed(aeadEncrypt(key, utf8(contact.fingerprint), utf8(`contact|${contact.id}|fingerprint`)));
+  const fpTag = computeContactFpTag(contact.fingerprint, key);
+
+  conn.execute(
+    `INSERT OR REPLACE INTO contacts
+     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [
+      contact.id,
+      contact.maskIndex,
+      sealedAlias,
+      sealedSignPk,
+      sealedDhPk,
+      sealedFp,
+      fpTag,
+      contact.verifiedAt,
+      contact.createdAt,
+    ],
+  );
+}
+
+function parseContactRow(row: any, vaultKey: Uint8Array): StoredContactRecord | null {
+  try {
+    const id = row.id;
+
+    // Decrypt alias
+    let alias = row.alias;
+    const sealedAlias = typeof row.alias === 'string' ? unpackSealed(row.alias) : null;
+    if (sealedAlias) {
+      const pt = aeadDecrypt(vaultKey, sealedAlias, utf8(`contact|${id}|alias`));
+      if (pt) alias = fromUtf8(pt);
+    }
+
+    // Decrypt signPk
+    let signPk: Uint8Array;
+    const sealedSign = typeof row.sign_pk === 'string' ? unpackSealed(row.sign_pk) : null;
+    if (sealedSign) {
+      const pt = aeadDecrypt(vaultKey, sealedSign, utf8(`contact|${id}|sign_pk`));
+      signPk = pt ?? new Uint8Array(32);
+    } else if (row.sign_pk instanceof Uint8Array) {
+      signPk = row.sign_pk;
+    } else {
+      signPk = new Uint8Array(row.sign_pk ?? 32);
+    }
+
+    // Decrypt dhPk
+    let dhPk: Uint8Array;
+    const sealedDh = typeof row.dh_pk === 'string' ? unpackSealed(row.dh_pk) : null;
+    if (sealedDh) {
+      const pt = aeadDecrypt(vaultKey, sealedDh, utf8(`contact|${id}|dh_pk`));
+      dhPk = pt ?? new Uint8Array(32);
+    } else if (row.dh_pk instanceof Uint8Array) {
+      dhPk = row.dh_pk;
+    } else {
+      dhPk = new Uint8Array(row.dh_pk ?? 32);
+    }
+
+    // Decrypt fingerprint
+    let fingerprint = row.fingerprint;
+    const sealedFp = typeof row.fingerprint === 'string' ? unpackSealed(row.fingerprint) : null;
+    if (sealedFp) {
+      const pt = aeadDecrypt(vaultKey, sealedFp, utf8(`contact|${id}|fingerprint`));
+      if (pt) fingerprint = fromUtf8(pt);
+    }
+
+    return {
+      id,
+      maskIndex: row.mask_index,
+      alias,
+      signPk,
+      dhPk,
+      fingerprint,
+      verifiedAt: row.verified_at ?? null,
+      createdAt: row.created_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function loadContactRow(id: string): StoredContactRecord | null {
+  if (!active) return null;
+  const rows = getDb().execute<any>('SELECT * FROM contacts WHERE id = ?', [id]).rows;
+  if (!rows || rows.length === 0) return null;
+  return parseContactRow(rows[0], active.vaultKey);
+}
+
+export function loadContactRowByFingerprint(fingerprint: string): StoredContactRecord | null {
+  if (!active) return null;
+  const tag = computeContactFpTag(fingerprint, active.vaultKey);
+  const rows = getDb().execute<any>('SELECT * FROM contacts WHERE fp_tag = ?', [tag]).rows;
+  if (rows && rows.length > 0) {
+    const contact = parseContactRow(rows[0], active.vaultKey);
+    if (contact && contact.fingerprint === fingerprint) return contact;
+  }
+  // Fallback: list all and match
+  const all = listContactRows();
+  return all.find((c) => c.fingerprint === fingerprint) ?? null;
+}
+
+export function listContactRows(): StoredContactRecord[] {
+  if (!active) return [];
+  const rows = getDb().execute<any>('SELECT * FROM contacts ORDER BY created_at DESC').rows;
+  if (!rows) return [];
+  const contacts: StoredContactRecord[] = [];
+  for (const r of rows) {
+    const c = parseContactRow(r, active.vaultKey);
+    if (c) contacts.push(c);
+  }
+  return contacts;
+}
+
+export function updateContactVerification(id: string, verifiedAt: number | null): void {
+  if (!active) return;
+  getDb().execute('UPDATE contacts SET verified_at = ? WHERE id = ?', [verifiedAt, id]);
+}
+
 /**
  * Seeds the decoy with neutral, boring, plausibly-aged content: a handful of
  * contacts and logistics chatter spread over the past few weeks. An empty
@@ -657,20 +900,19 @@ function seedDecoy(conn: SqlConnection, vaultKey: Uint8Array): void {
     people.forEach(([alias, fp], i) => {
       const contactId = `dc_${i}`;
       const threadId = `dt_${i}`;
-      conn.execute(
-        `INSERT OR REPLACE INTO contacts
-         (id, mask_index, alias, sign_pk, dh_pk, fingerprint, verified_at, created_at)
-         VALUES (?,?,?,?,?,?,?,?)`,
-        [
-          contactId,
-          1,
+      saveContactRow(
+        {
+          id: contactId,
+          maskIndex: 1,
           alias,
-          randomBytes(32),
-          randomBytes(32),
-          fp,
-          i < 2 ? now - 20 * DAY : null,
-          now - (30 - i * 4) * DAY,
-        ],
+          signPk: randomBytes(32),
+          dhPk: randomBytes(32),
+          fingerprint: fp,
+          verifiedAt: i < 2 ? now - 20 * DAY : null,
+          createdAt: now - (30 - i * 4) * DAY,
+        },
+        vaultKey,
+        conn,
       );
       conn.execute(
         `INSERT OR REPLACE INTO threads
@@ -1104,4 +1346,10 @@ export default {
   isProvisioned,
   saveSealedMasterSeed,
   loadSealedMasterSeed,
+  saveContactRow,
+  loadContactRow,
+  loadContactRowByFingerprint,
+  listContactRows,
+  updateContactVerification,
+  computeContactFpTag,
 };

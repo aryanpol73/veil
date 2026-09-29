@@ -17,7 +17,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomBytes, fromB64, x25519 } from '../client/src/crypto/keys';
+import { randomBytes, fromB64, toB64, x25519 } from '../client/src/crypto/keys';
 import {
   initAliceSession,
   initBobSession,
@@ -317,12 +317,93 @@ describe('Veil Double Ratchet Protocol', () => {
     assert.equal(result, null);
   });
 
+  it('prevents ratchet state desynchronization on unauthenticated packets with new DH keys (SEC-01)', () => {
+    const bobKeygen = x25519.keygen(randomBytes(32));
+    const alice = initAliceSession(new Uint8Array(bobKeygen.publicKey));
+    const threadId = 'th_desync_test';
+    const senderFp = 'ALICE_FP';
+
+    // Alice sends initial message 1
+    const msg1 = ratchetEncryptMessage({
+      state: alice,
+      plaintext: utf8('Legitimate message 1'),
+      threadId,
+      retention: 'persistent',
+      senderFp,
+      msgId: 'msg_1',
+    });
+
+    const bob = initBobSession(
+      new Uint8Array(bobKeygen.secretKey),
+      new Uint8Array(bobKeygen.publicKey),
+      fromB64(msg1.header.dhPk),
+    );
+
+    const d1 = ratchetDecryptMessage({ state: bob, payload: msg1, threadId, senderFp });
+    assert.equal(fromUtf8(d1!), 'Legitimate message 1');
+
+    // Snapshot Bob's local keys and counter before attack
+    const bobRootBefore = new Uint8Array(bob.rootKey);
+    const bobLocalPkBefore = new Uint8Array(bob.localDhPk);
+    const bobRecvCounterBefore = bob.recvCounter;
+
+    // Attacker injects a malicious message with a brand new DH key and bogus ciphertext
+    const attackerKeygen = x25519.keygen(randomBytes(32));
+    const attackerForgedPayload = {
+      header: {
+        dhPk: toB64(new Uint8Array(attackerKeygen.publicKey)),
+        pn: 0,
+        n: 0,
+        retention: 'persistent' as const,
+        msgId: 'msg_forged_eve',
+      },
+      nonce: randomBytes(24),
+      ciphertext: randomBytes(64), // Invalid ciphertext, fails Poly1305 check
+    };
+
+    // Bob attempts to decrypt attacker's forged message
+    const resAttacker = ratchetDecryptMessage({
+      state: bob,
+      payload: attackerForgedPayload,
+      threadId,
+      senderFp,
+    });
+    assert.equal(resAttacker, null);
+
+    // Verify Bob's state was NOT mutated/desynchronized
+    assert.deepEqual(bob.rootKey, bobRootBefore);
+    assert.deepEqual(bob.localDhPk, bobLocalPkBefore);
+    assert.equal(bob.recvCounter, bobRecvCounterBefore);
+
+    // Alice now sends legitimate message 2
+    const msg2 = ratchetEncryptMessage({
+      state: alice,
+      plaintext: utf8('Legitimate message 2 after attack'),
+      threadId,
+      retention: 'persistent',
+      senderFp,
+      msgId: 'msg_2',
+    });
+
+    // Bob can decrypt Alice's message with zero desynchronization!
+    const d2 = ratchetDecryptMessage({ state: bob, payload: msg2, threadId, senderFp });
+    assert.ok(d2);
+    assert.equal(fromUtf8(d2!), 'Legitimate message 2 after attack');
+  });
+
   it('serializes and restores ratchet state to/from stored schema', () => {
     const bobKeygen = x25519.keygen(randomBytes(32));
     const alice = initAliceSession(new Uint8Array(bobKeygen.publicKey));
     alice.sendCounter = 7;
     alice.recvCounter = 3;
     alice.prevChainLen = 2;
+    const sampleMsgKey = randomBytes(32);
+    alice.skippedKeys.set('fake_key_id:1', {
+      remoteDhPkHex: 'abcd1234',
+      counter: 1,
+      messageKey: sampleMsgKey,
+      createdAt: 1700000000,
+    });
 
     const stored = toStoredRatchet(alice);
     const restored = fromStoredRatchet(stored);
@@ -335,5 +416,10 @@ describe('Veil Double Ratchet Protocol', () => {
     assert.equal(restored.sendCounter, 7);
     assert.equal(restored.recvCounter, 3);
     assert.equal(restored.prevChainLen, 2);
+    assert.equal(restored.skippedKeys.size, 1);
+    const restoredEntry = restored.skippedKeys.get('fake_key_id:1');
+    assert.ok(restoredEntry);
+    assert.equal(restoredEntry.counter, 1);
+    assert.deepEqual(restoredEntry.messageKey, sampleMsgKey);
   });
 });

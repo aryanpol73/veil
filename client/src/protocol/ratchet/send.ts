@@ -34,8 +34,12 @@ export function buildMessageAad(
   retention: RetentionMode,
   senderFp: string,
   msgId: string,
+  ttlMs: number = 0,
+  dhPk: string = '',
 ): Uint8Array {
-  return utf8(`veil.msg.v1|${threadId}|${counter}|${retention}|${senderFp}|${msgId}`);
+  return utf8(
+    `veil.msg.v2|${threadId}|${counter}|${retention}|${senderFp}|${msgId}|${ttlMs}|${dhPk}`,
+  );
 }
 
 export interface RatchetSendParams {
@@ -44,6 +48,7 @@ export interface RatchetSendParams {
   threadId: string;
   retention: RetentionMode;
   senderFp: string;
+  recipientFp?: string;
   msgId: string;
   ttlMs?: number;
 }
@@ -91,7 +96,8 @@ export function ratchetEncryptMessage(params: RatchetSendParams): RatchetEncrypt
   state.sendCounter += 1;
 
   // Build AAD binding all security parameters
-  const aad = buildMessageAad(threadId, counter, retention, senderFp, msgId);
+  const dhPkStr = toB64(state.localDhPk);
+  const aad = buildMessageAad(threadId, counter, retention, senderFp, msgId, ttlMs ?? 0, dhPkStr);
 
   // Encrypt with fresh 24-byte nonce
   const sealed = aeadEncrypt(messageKey, plaintext, aad);
@@ -107,6 +113,8 @@ export function ratchetEncryptMessage(params: RatchetSendParams): RatchetEncrypt
       retention,
       ttlMs,
       msgId,
+      senderFp,
+      recipientFp: params.recipientFp,
     },
     nonce: sealed.nonce,
     ciphertext: sealed.ciphertext,

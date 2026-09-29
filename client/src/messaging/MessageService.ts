@@ -132,7 +132,10 @@ export class MessageService {
 
     this.notifyListeners(stored);
 
-    // 2. Encrypt payload with Double Ratchet
+    // 2. Derive symmetrical conversation ID for AAD binding
+    const conversationId = [senderFp, contact.fingerprint].sort().join(':');
+
+    // 3. Encrypt payload with Double Ratchet
     const encrypted = this.ratchets.encrypt(
       threadId,
       utf8(body),
@@ -141,12 +144,13 @@ export class MessageService {
       msgId,
       contact,
       ttlMs,
+      conversationId,
     );
 
-    // 3. Target recipient's blinded inbox address for current epoch
+    // 4. Target recipient's blinded inbox address for current epoch
     const targetInbox = blindedInboxId(contact.dhPk);
 
-    // 4. Encode and pad to uniform 4,096 bytes
+    // 5. Encode and pad to uniform 4,096 bytes
     const paddedEnvelope = EnvelopeCodec.encode({
       inbox: targetInbox,
       header: encrypted.header,
@@ -155,7 +159,7 @@ export class MessageService {
       id: msgId,
     });
 
-    // 5. Dispatch across blind relay and wait for acceptance
+    // 6. Dispatch across blind relay and wait for acceptance
     try {
       await this.relay.sendEnvelope(targetInbox, paddedEnvelope);
       markDelivered(msgId);
@@ -184,32 +188,42 @@ export class MessageService {
       return;
     }
 
-    // Identify thread by matching contacts or fallback to peer DH key
-    const contacts = contactManager.listContacts();
-    let contact = contacts.find((c) => {
-      // Direct match or active ratchet match
-      const state = this.ratchets.getOrLoadRatchet(`th_${c.id}`);
-      return (
-        c.dhPk.every((b, i) => b === remoteDhPk[i]) ||
-        (state?.remoteDhPk && state.remoteDhPk.every((b, i) => b === remoteDhPk[i]))
-      );
-    });
+    // 1. Identify contact via header.senderFp if present, or fallback to matching known contacts
+    const senderFp = envelope.header.senderFp;
+    let contact: Contact | null = null;
+    if (senderFp) {
+      contact = contactManager.getContactByFingerprint(senderFp);
+    }
 
-    // If contact unknown, create an auto-discovered contact record
     if (!contact) {
+      const contacts = contactManager.listContacts();
+      contact =
+        contacts.find((c) => {
+          const state = this.ratchets.getOrLoadRatchet(`th_${c.id}`);
+          return (
+            c.dhPk.every((b, i) => b === remoteDhPk[i]) ||
+            (state?.remoteDhPk && state.remoteDhPk.every((b, i) => b === remoteDhPk[i]))
+          );
+        }) ?? null;
+    }
+
+    // If contact still unknown, create an auto-discovered contact record
+    if (!contact) {
+      const alias = senderFp ? `Peer ${senderFp.slice(0, 4)}` : `Peer ${envelope.header.dhPk.slice(0, 4)}`;
       contact = contactManager.saveContact({
         maskIndex: this.activeMask.index,
-        alias: `Contact ${envelope.header.dhPk.slice(0, 6)}`,
-        signPk: remoteDhPk, // Placeholder until verified out-of-band
+        alias,
+        signPk: remoteDhPk,
         dhPk: remoteDhPk,
         verified: false,
       });
     }
 
     const threadId = `th_${contact.id}`;
-    const senderFp = contact.fingerprint;
+    const effectiveSenderFp = senderFp ?? contact.fingerprint;
+    const conversationId = [effectiveSenderFp, this.activeMask.fingerprint].sort().join(':');
 
-    // Decrypt payload with Double Ratchet
+    // Decrypt payload with Double Ratchet using symmetric conversationId
     const pt = this.ratchets.decrypt(
       threadId,
       {
@@ -217,9 +231,10 @@ export class MessageService {
         nonce,
         ciphertext,
       },
-      senderFp,
+      effectiveSenderFp,
       this.activeMask,
       remoteDhPk,
+      conversationId,
     );
 
     if (!pt) {

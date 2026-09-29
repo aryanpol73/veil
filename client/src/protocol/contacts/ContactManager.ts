@@ -14,7 +14,15 @@
  */
 
 import { computeFingerprint, timingSafeEqual, type ParsedInvite } from '../../crypto/keys';
-import { getDb } from '../../storage/db';
+import {
+  getDb,
+  saveContactRow,
+  loadContactRow,
+  loadContactRowByFingerprint,
+  listContactRows,
+  updateContactVerification,
+  type StoredContactRecord,
+} from '../../storage/db';
 import type { Contact, Thread, VerificationState } from '../../types/models';
 
 export interface CreateContactInput {
@@ -31,39 +39,32 @@ export class ContactManager {
    * Lists all contacts in the active vault partition.
    */
   public listContacts(): Contact[] {
-    const db = getDb();
-    const rows = db.execute<any>(
-      'SELECT * FROM contacts ORDER BY created_at DESC',
-    ).rows;
-
-    return rows.map((r) => this.rowToContact(r));
+    const records = listContactRows();
+    return records.map((r) => this.recordToContact(r));
   }
 
   /**
    * Retrieves a contact by their unique local ID.
    */
   public getContact(id: string): Contact | null {
-    const db = getDb();
-    const rows = db.execute<any>('SELECT * FROM contacts WHERE id = ?', [id]).rows;
-    if (!rows || rows.length === 0) return null;
-    return this.rowToContact(rows[0]);
+    const r = loadContactRow(id);
+    if (!r) return null;
+    return this.recordToContact(r);
   }
 
   /**
    * Finds a contact by matching their cryptographic fingerprint.
    */
   public getContactByFingerprint(fingerprint: string): Contact | null {
-    const db = getDb();
-    const rows = db.execute<any>('SELECT * FROM contacts WHERE fingerprint = ?', [fingerprint]).rows;
-    if (!rows || rows.length === 0) return null;
-    return this.rowToContact(rows[0]);
+    const r = loadContactRowByFingerprint(fingerprint);
+    if (!r) return null;
+    return this.recordToContact(r);
   }
 
   /**
    * Creates or updates a contact. Detects key changes and triggers CHANGED_IDENTITY security event.
    */
   public saveContact(input: CreateContactInput): Contact {
-    const db = getDb();
     const now = Date.now();
     const fingerprint = computeFingerprint(input.signPk, input.dhPk);
     const id = input.id ?? `ct_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -89,21 +90,16 @@ export class ContactManager {
 
     const verifiedAt = state === 'VERIFIED' ? (existing?.verifiedAt ?? now) : null;
 
-    db.execute(
-      `INSERT OR REPLACE INTO contacts
-       (id, mask_index, alias, sign_pk, dh_pk, fingerprint, verified_at, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [
-        id,
-        input.maskIndex,
-        input.alias,
-        input.signPk,
-        input.dhPk,
-        fingerprint,
-        verifiedAt,
-        existing?.createdAt ?? now,
-      ],
-    );
+    saveContactRow({
+      id,
+      maskIndex: input.maskIndex,
+      alias: input.alias,
+      signPk: input.signPk,
+      dhPk: input.dhPk,
+      fingerprint,
+      verifiedAt,
+      createdAt: existing?.createdAt ?? now,
+    });
 
     return {
       id,
@@ -122,9 +118,8 @@ export class ContactManager {
    * Updates verification state (e.g. user toggles Verified after checking safety numbers).
    */
   public setVerificationState(id: string, state: VerificationState): void {
-    const db = getDb();
     const verifiedAt = state === 'VERIFIED' ? Date.now() : null;
-    db.execute('UPDATE contacts SET verified_at = ? WHERE id = ?', [verifiedAt, id]);
+    updateContactVerification(id, verifiedAt);
   }
 
   /**
@@ -169,20 +164,18 @@ export class ContactManager {
     };
   }
 
-  private rowToContact(r: any): Contact {
-    const signPk = r.sign_pk instanceof Uint8Array ? r.sign_pk : new Uint8Array(r.sign_pk);
-    const dhPk = r.dh_pk instanceof Uint8Array ? r.dh_pk : new Uint8Array(r.dh_pk);
-    const state: VerificationState = r.verified_at ? 'VERIFIED' : 'UNVERIFIED';
+  private recordToContact(r: StoredContactRecord): Contact {
+    const state: VerificationState = r.verifiedAt ? 'VERIFIED' : 'UNVERIFIED';
 
     return {
       id: r.id,
-      maskIndex: r.mask_index,
+      maskIndex: r.maskIndex,
       alias: r.alias,
-      signPk,
-      dhPk,
+      signPk: r.signPk,
+      dhPk: r.dhPk,
       fingerprint: r.fingerprint,
-      verifiedAt: r.verified_at,
-      createdAt: r.created_at,
+      verifiedAt: r.verifiedAt,
+      createdAt: r.createdAt,
       verificationState: state,
     };
   }

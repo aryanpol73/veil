@@ -6,10 +6,23 @@
  * ============================================================================
  */
 
-import type { RatchetState as StoredRatchetState } from '../../storage/db';
-import type { DoubleRatchetState } from './state';
+import type { RatchetState as StoredRatchetState, StoredSkippedKey } from '../../storage/db';
+import type { DoubleRatchetState, SkippedKeyEntry } from './state';
 
 export function toStoredRatchet(state: DoubleRatchetState): StoredRatchetState {
+  const skippedList: StoredSkippedKey[] = [];
+  if (state.skippedKeys) {
+    for (const [id, entry] of state.skippedKeys) {
+      skippedList.push({
+        id,
+        remoteDhPkHex: entry.remoteDhPkHex,
+        counter: entry.counter,
+        messageKey: entry.messageKey,
+        createdAt: entry.createdAt,
+      });
+    }
+  }
+
   return {
     rootKey: state.rootKey,
     sendChainKey: state.sendChainKey,
@@ -20,6 +33,7 @@ export function toStoredRatchet(state: DoubleRatchetState): StoredRatchetState {
     sendCounter: state.sendCounter,
     recvCounter: state.recvCounter,
     prevChainLen: state.prevChainLen,
+    skippedKeys: skippedList,
   };
 }
 
@@ -44,6 +58,23 @@ export function fromStoredRatchet(
     throw new Error('[veil/ratchet] invalid stored ratchet state: missing core keys');
   }
 
+  const restoredSkipped = new Map<string, SkippedKeyEntry>();
+  const sourceSkipped = stored.skippedKeys ?? stored.skipped_keys;
+  if (sourceSkipped && Array.isArray(sourceSkipped)) {
+    for (const entry of sourceSkipped) {
+      restoredSkipped.set(entry.id, {
+        remoteDhPkHex: entry.remoteDhPkHex ?? '',
+        counter: entry.counter,
+        messageKey: new Uint8Array(entry.messageKey),
+        createdAt: entry.createdAt,
+      });
+    }
+  } else if (skippedKeys) {
+    for (const [k, v] of skippedKeys) {
+      restoredSkipped.set(k, v);
+    }
+  }
+
   return {
     rootKey: new Uint8Array(rootKey),
     sendChainKey: sendChainKey ? new Uint8Array(sendChainKey) : null,
@@ -54,7 +85,7 @@ export function fromStoredRatchet(
     sendCounter,
     recvCounter,
     prevChainLen,
-    skippedKeys: skippedKeys ?? new Map(),
+    skippedKeys: restoredSkipped,
   };
 }
 

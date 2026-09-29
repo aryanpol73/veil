@@ -17,7 +17,13 @@ import { aeadDecrypt, fromB64, timingSafeEqual, wipe } from '../../crypto/keys';
 import { performDhRatchetStep } from './dhRatchet';
 import { buildMessageAad } from './send';
 import { consumeSkippedKey, storeSkippedKey } from './skippedKeys';
-import { MAX_CHAIN_SKIP, type DoubleRatchetState, type RatchetEncryptedPayload } from './state';
+import {
+  MAX_CHAIN_SKIP,
+  cloneRatchetState,
+  commitRatchetState,
+  type DoubleRatchetState,
+  type RatchetEncryptedPayload,
+} from './state';
 import { stepSymmetricChain } from './symmetricRatchet';
 
 export interface RatchetReceiveParams {
@@ -30,6 +36,10 @@ export interface RatchetReceiveParams {
 /**
  * Decrypts an inbound message and advances the Double Ratchet state.
  * Returns the decrypted plaintext as a Uint8Array, or null if decryption/authentication fails.
+ *
+ * CRITICAL SECURITY INVARIANT:
+ * Never mutates live `state` unless AEAD authentication succeeds. Operates on a tentative
+ * cloned working state so forged or corrupted packets cannot brick or desynchronize ratchet sessions.
  */
 export function ratchetDecryptMessage(params: RatchetReceiveParams): Uint8Array | null {
   const { state, payload, threadId, senderFp } = params;
@@ -43,79 +53,110 @@ export function ratchetDecryptMessage(params: RatchetReceiveParams): Uint8Array 
     return null;
   }
 
+  // Work on a tentative cloned state to prevent ratchet state desynchronization
+  // if authentication fails or a packet is malformed/forged.
+  const workingState = cloneRatchetState(state);
+
   // 1. Check if message key was already computed and cached as a skipped key
-  const cachedKey = consumeSkippedKey(state, remoteDhPk, header.n);
+  const cachedKey = consumeSkippedKey(workingState, remoteDhPk, header.n);
   if (cachedKey) {
-    const aad = buildMessageAad(threadId, header.n, header.retention, senderFp, header.msgId);
+    const aad = buildMessageAad(
+      threadId,
+      header.n,
+      header.retention,
+      senderFp,
+      header.msgId,
+      header.ttlMs ?? 0,
+      header.dhPk,
+    );
     const plaintext = aeadDecrypt(cachedKey, { nonce, ciphertext }, aad);
     wipe(cachedKey);
-    return plaintext;
+    if (plaintext) {
+      commitRatchetState(state, workingState);
+      return plaintext;
+    }
+    return null;
   }
 
   // 2. Check if a DH ratchet step is needed (remote DH public key changed)
   const isNewRemoteKey =
-    !state.remoteDhPk || !timingSafeEqual(state.remoteDhPk, remoteDhPk);
+    !workingState.remoteDhPk || !timingSafeEqual(workingState.remoteDhPk, remoteDhPk);
 
   if (isNewRemoteKey) {
     // If we have an active receiving chain, skip any remaining unreceived keys up to header.pn
-    if (state.recvChainKey && state.remoteDhPk) {
-      if (header.pn < state.recvCounter) {
+    if (workingState.recvChainKey && workingState.remoteDhPk) {
+      if (header.pn < workingState.recvCounter) {
         // Inconsistent previous chain length
         return null;
       }
-      if (header.pn - state.recvCounter > MAX_CHAIN_SKIP) {
+      if (header.pn - workingState.recvCounter > MAX_CHAIN_SKIP) {
         return null;
       }
-      while (state.recvCounter < header.pn) {
-        const { nextChainKey, messageKey } = stepSymmetricChain(state.recvChainKey);
-        wipe(state.recvChainKey);
-        state.recvChainKey = nextChainKey;
-        storeSkippedKey(state, state.remoteDhPk, state.recvCounter, messageKey);
+      while (workingState.recvCounter < header.pn) {
+        const { nextChainKey, messageKey } = stepSymmetricChain(workingState.recvChainKey);
+        wipe(workingState.recvChainKey);
+        workingState.recvChainKey = nextChainKey;
+        storeSkippedKey(workingState, workingState.remoteDhPk, workingState.recvCounter, messageKey);
         wipe(messageKey);
-        state.recvCounter += 1;
+        workingState.recvCounter += 1;
       }
     }
 
-    // Execute DH ratchet transition
-    performDhRatchetStep(state, remoteDhPk);
+    // Execute DH ratchet transition on tentative working state
+    performDhRatchetStep(workingState, remoteDhPk);
   }
 
   // 3. Ensure we have an active receiving chain
-  if (!state.recvChainKey) {
+  if (!workingState.recvChainKey) {
     return null;
   }
 
   // 4. Reject past messages that were not in the skipped keys cache (duplicate/replay)
-  if (header.n < state.recvCounter) {
+  if (header.n < workingState.recvCounter) {
     return null;
   }
 
   // 5. Reject excessive skips to prevent memory exhaustion DoS
-  if (header.n - state.recvCounter > MAX_CHAIN_SKIP) {
+  if (header.n - workingState.recvCounter > MAX_CHAIN_SKIP) {
     return null;
   }
 
   // 6. Skip and cache any intermediate message keys ahead of header.n
-  while (state.recvCounter < header.n) {
-    const { nextChainKey, messageKey } = stepSymmetricChain(state.recvChainKey);
-    wipe(state.recvChainKey);
-    state.recvChainKey = nextChainKey;
-    storeSkippedKey(state, state.remoteDhPk!, state.recvCounter, messageKey);
+  while (workingState.recvCounter < header.n) {
+    const { nextChainKey, messageKey } = stepSymmetricChain(workingState.recvChainKey);
+    wipe(workingState.recvChainKey);
+    workingState.recvChainKey = nextChainKey;
+    storeSkippedKey(workingState, workingState.remoteDhPk!, workingState.recvCounter, messageKey);
     wipe(messageKey);
-    state.recvCounter += 1;
+    workingState.recvCounter += 1;
   }
 
   // 7. Derive the target message key
-  const { nextChainKey, messageKey } = stepSymmetricChain(state.recvChainKey);
-  wipe(state.recvChainKey);
-  state.recvChainKey = nextChainKey;
-  state.recvCounter += 1;
+  const { nextChainKey, messageKey } = stepSymmetricChain(workingState.recvChainKey);
+  wipe(workingState.recvChainKey);
+  workingState.recvChainKey = nextChainKey;
+  workingState.recvCounter += 1;
 
   // 8. Verify AAD and decrypt
-  const aad = buildMessageAad(threadId, header.n, header.retention, senderFp, header.msgId);
+  const aad = buildMessageAad(
+    threadId,
+    header.n,
+    header.retention,
+    senderFp,
+    header.msgId,
+    header.ttlMs ?? 0,
+    header.dhPk,
+  );
   const plaintext = aeadDecrypt(messageKey, { nonce, ciphertext }, aad);
   wipe(messageKey);
 
+  if (!plaintext) {
+    // Authentication failed: discard workingState completely. Live state remains untouched!
+    return null;
+  }
+
+  // Authentication succeeded: commit working state to live state
+  commitRatchetState(state, workingState);
   return plaintext;
 }
 

@@ -74,6 +74,7 @@ export class RatchetManager {
     msgId: string,
     contact: Contact,
     ttlMs?: number,
+    aadContext?: string,
   ): RatchetEncryptedPayload {
     let state = this.getOrLoadRatchet(threadId);
     if (!state) {
@@ -83,11 +84,12 @@ export class RatchetManager {
     const payload = ratchetEncryptMessage({
       state,
       plaintext,
-      threadId,
+      threadId: aadContext ?? threadId,
       retention,
       senderFp,
       msgId,
       ttlMs,
+      recipientFp: contact.fingerprint,
     });
 
     this.persistRatchet(threadId, state);
@@ -103,6 +105,7 @@ export class RatchetManager {
     senderFp: string,
     mask: MaskIdentity,
     remoteDhPk: Uint8Array,
+    aadContext?: string,
   ): Uint8Array | null {
     let state = this.getOrLoadRatchet(threadId);
     if (!state) {
@@ -112,7 +115,7 @@ export class RatchetManager {
     const plaintext = ratchetDecryptMessage({
       state,
       payload,
-      threadId,
+      threadId: aadContext ?? threadId,
       senderFp,
     });
 

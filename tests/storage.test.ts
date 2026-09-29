@@ -31,10 +31,13 @@ import {
   loadSealedMasterSeed,
   RamVault,
   setSqlDriver,
+  saveRatchet,
+  loadRatchet,
 } from '../client/src/storage/db';
 import { memoryDriver } from '../client/src/storage/sqliteDriver';
 import { Keychain } from '../client/src/storage/keychain';
-import { generateMasterSeed } from '../client/src/crypto/keys';
+import { generateMasterSeed, randomBytes, unpackSealed, toHex } from '../client/src/crypto/keys';
+import { ContactManager } from '../client/src/protocol/contacts/ContactManager';
 
 describe('Veil Dual-Partition Vault & Storage', () => {
   const MASTER_PIN = '123456';
@@ -193,5 +196,115 @@ describe('Veil Dual-Partition Vault & Storage', () => {
     // Locking vault purges RamVault
     await lockVault();
     assert.equal(RamVault.size, 0);
+  });
+
+  it('encrypts contact records at rest with AEAD and supports blind-index lookup (SEC-02, SEC-03)', async () => {
+    const res = await unlockWithPin(MASTER_PIN);
+    assert.equal(res.ok, true);
+
+    const cm = new ContactManager();
+    const signPk = randomBytes(32);
+    const dhPk = randomBytes(32);
+
+    const contact = cm.saveContact({
+      id: 'ct_sec02_test',
+      maskIndex: 0,
+      alias: 'Whistleblower Alpha',
+      signPk,
+      dhPk,
+      verified: true,
+    });
+
+    assert.equal(contact.alias, 'Whistleblower Alpha');
+
+    // Inspect RAW database row directly to verify zero plaintext leakage
+    const db = getDb();
+    const rawRows = db.execute<any>('SELECT * FROM contacts WHERE id = ?', ['ct_sec02_test']).rows;
+    assert.equal(rawRows.length, 1);
+    const raw = rawRows[0];
+
+    // 1. Plaintext alias must NEVER appear in the stored row
+    assert.notEqual(raw.alias, 'Whistleblower Alpha');
+    assert.ok(unpackSealed(raw.alias), 'alias must be packed sealed AEAD payload');
+
+    // 2. Plaintext fingerprint must NEVER appear in the stored row
+    assert.notEqual(raw.fingerprint, contact.fingerprint);
+    assert.ok(unpackSealed(raw.fingerprint), 'fingerprint must be packed sealed AEAD payload');
+
+    // 3. Public keys must be sealed AEAD payloads
+    assert.ok(unpackSealed(raw.sign_pk), 'sign_pk must be packed sealed AEAD payload');
+    assert.ok(unpackSealed(raw.dh_pk), 'dh_pk must be packed sealed AEAD payload');
+
+    // 4. Blind index tag exists and differs from plaintext fingerprint
+    assert.ok(raw.fp_tag);
+    assert.notEqual(raw.fp_tag, contact.fingerprint);
+
+    // 5. Lookups via ContactManager decrypt transparently
+    const retrievedById = cm.getContact('ct_sec02_test');
+    assert.ok(retrievedById);
+    assert.equal(retrievedById.alias, 'Whistleblower Alpha');
+    assert.deepEqual(retrievedById.signPk, signPk);
+    assert.deepEqual(retrievedById.dhPk, dhPk);
+    assert.equal(retrievedById.fingerprint, contact.fingerprint);
+
+    // 6. Fast lookup by fingerprint via blind index
+    const retrievedByFp = cm.getContactByFingerprint(contact.fingerprint);
+    assert.ok(retrievedByFp);
+    assert.equal(retrievedByFp.id, 'ct_sec02_test');
+    assert.equal(retrievedByFp.alias, 'Whistleblower Alpha');
+  });
+
+  it('persists and restores skipped ratchet keys and seals DH public keys at rest (SEC-05)', async () => {
+    const res = await unlockWithPin(MASTER_PIN);
+    assert.equal(res.ok, true);
+
+    const threadId = 'th_skipped_keys_test';
+    const rootKey = randomBytes(32);
+    const sendDhSk = randomBytes(32);
+    const sendDhPk = randomBytes(32);
+    const recvDhPk = randomBytes(32);
+    const skippedMsgKey = randomBytes(32);
+    const remoteHex = toHex(recvDhPk);
+
+    saveRatchet(threadId, {
+      rootKey,
+      sendChainKey: randomBytes(32),
+      recvChainKey: randomBytes(32),
+      sendDhSk,
+      sendDhPk,
+      recvDhPk,
+      sendCounter: 2,
+      recvCounter: 5,
+      prevChainLen: 1,
+      skippedKeys: [
+        {
+          id: `${remoteHex}:3`,
+          remoteDhPkHex: remoteHex,
+          counter: 3,
+          messageKey: skippedMsgKey,
+          createdAt: 1700000000000,
+        },
+      ],
+    });
+
+    // Verify raw row has sealed public keys and sealed skipped keys
+    const db = getDb();
+    const rawRow = db.execute<any>('SELECT * FROM ratchets WHERE thread_id = ?', [threadId]).rows[0];
+    assert.ok(rawRow);
+    assert.ok(unpackSealed(rawRow.send_dh_pk), 'send_dh_pk must be sealed AEAD');
+    assert.ok(unpackSealed(rawRow.recv_dh_pk), 'recv_dh_pk must be sealed AEAD');
+    assert.ok(unpackSealed(rawRow.skipped_keys), 'skipped_keys must be sealed AEAD');
+
+    // Restore and verify state
+    const loaded = loadRatchet(threadId);
+    assert.ok(loaded);
+    assert.deepEqual(loaded.sendDhPk, sendDhPk);
+    assert.deepEqual(loaded.recvDhPk, recvDhPk);
+    assert.ok(loaded.skippedKeys);
+    assert.equal(loaded.skippedKeys.length, 1);
+    assert.equal(loaded.skippedKeys[0].id, `${remoteHex}:3`);
+    assert.equal(loaded.skippedKeys[0].counter, 3);
+    assert.deepEqual(loaded.skippedKeys[0].messageKey, skippedMsgKey);
+    assert.equal(loaded.skippedKeys[0].createdAt, 1700000000000);
   });
 });

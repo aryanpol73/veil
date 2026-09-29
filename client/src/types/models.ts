@@ -63,6 +63,10 @@ export interface RatchetHeader {
   ttlMs?: number;
   /** Unique message ID */
   msgId: string;
+  /** Sender Crockford Base32 fingerprint */
+  senderFp?: string;
+  /** Recipient Crockford Base32 fingerprint */
+  recipientFp?: string;
 }
 
 export interface WireEnvelope {
