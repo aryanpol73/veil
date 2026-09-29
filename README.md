@@ -1,7 +1,3 @@
-Absolutely. For Veil, I’d make the README feel like a **serious cryptographic project**, not a generic React/Expo README. Also, based on the current audit, it should **not claim production-ready or independently audited**. 
-
-Copy this as `README.md`:
-
 ````markdown
 # VEIL
 
