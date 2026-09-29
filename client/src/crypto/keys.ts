@@ -30,6 +30,7 @@ import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { blake2b } from '@noble/hashes/blake2.js';
 import { argon2id } from '@noble/hashes/argon2.js';
+import { randomBytes as nobleRandomBytes } from '@noble/hashes/utils.js';
 
 /**
  * Kept for interface compatibility with App.tsx and callers.
@@ -83,11 +84,17 @@ export const MASK_INDEX = { PERSONAL: 0, GHOST: 1 } as const;
 /* Byte utilities (Pure TypeScript — no Buffer / atob / btoa)                  */
 /* -------------------------------------------------------------------------- */
 
-/** CSPRNG using standard crypto.getRandomValues (polyfilled in index.js). */
+/** CSPRNG using standard crypto.getRandomValues (polyfilled via react-native-get-random-values / globalThis) or noble fallback. */
 export const randomBytes = (n: number): Uint8Array => {
   const b = new Uint8Array(n);
-  crypto.getRandomValues(b);
-  return b;
+  const g: any = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : {};
+  const cryptoObj = g.crypto;
+
+  if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
+    cryptoObj.getRandomValues(b);
+    return b;
+  }
+  return nobleRandomBytes(n);
 };
 
 const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
