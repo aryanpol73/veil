@@ -1,9 +1,9 @@
 /**
  * ============================================================================
- *  VEIL — THREAD LIST SCREEN
+ *  VEIL — THREAD LIST SCREEN (OBSIDIAN PRISM)
  * ============================================================================
- *  Displays active encrypted conversations, relay status, invitation sharing,
- *  and invitation importing.
+ *  Displays active encrypted conversations, relay status, identity telemetry,
+ *  deliberate cryptographic empty state, and polished invitation flow.
  * ============================================================================
  */
 
@@ -13,12 +13,8 @@ import {
   Text,
   View,
   FlatList,
-  Pressable,
-  Modal,
-  TextInput,
-  Share,
+  Platform,
 } from 'react-native';
-import { BlurView } from 'expo-blur';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import {
@@ -27,16 +23,21 @@ import {
   Borders,
   Space,
   Radius,
-  Blur,
   withAlpha,
   glow,
 } from '../theme/obsidianPrism';
 import PrismBackdrop from '../components/PrismBackdrop';
-import SpecularGlass from '../components/SpecularGlass';
+import PrismSurface from '../components/PrismSurface';
+import PrismButton from '../components/PrismButton';
+import CryptoLabel from '../components/CryptoLabel';
+import MaskHeader from '../components/MaskHeader';
+import FingerprintDisplay from '../components/FingerprintDisplay';
+import EmptyState from '../components/EmptyState';
+import InviteModal from '../components/InviteModal';
 import { getDb, lockVault } from '../storage/db';
 import { identityManager } from '../identity/IdentityManager';
 import { contactManager } from '../protocol/contacts/ContactManager';
-import { createInvite, parseInvite } from '../crypto/keys';
+import { createInvite, type ParsedInvite } from '../crypto/keys';
 import { relayClient, type ConnectionStatus } from '../transport/RelayClient';
 import type { Thread } from '../types/models';
 import type { RootNavigationProp } from '../types/navigation';
@@ -50,8 +51,6 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
   const [relayStatus, setRelayStatus] = useState<ConnectionStatus>('disconnected');
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [generatedInviteUri, setGeneratedInviteUri] = useState<string | null>(null);
-  const [importUri, setImportUri] = useState('');
-  const [importError, setImportError] = useState<string | null>(null);
 
   const activeMask = identityManager.getActiveMask();
 
@@ -90,65 +89,46 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
   }, [loadThreads]);
 
   const handleLock = async () => {
-    try {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
-    } catch {
-      /* ignore */
+    if (Platform.OS !== 'web') {
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+      } catch {
+        /* ignore */
+      }
     }
     await lockVault();
     identityManager.lock();
     navigation.replace('Unlock');
   };
 
-  const handleCreateInvite = () => {
+  const handleOpenInvite = () => {
     if (!activeMask) return;
-    try {
-      Haptics.selectionAsync().catch(() => {});
-    } catch {
-      /* ignore */
+    if (Platform.OS !== 'web') {
+      try {
+        Haptics.selectionAsync().catch(() => {});
+      } catch {
+        /* ignore */
+      }
     }
     const { uri } = createInvite(activeMask);
     setGeneratedInviteUri(uri);
     setShowInviteModal(true);
   };
 
-  const handleShareInvite = async () => {
-    if (!generatedInviteUri) return;
-    try {
-      await Share.share({
-        message: generatedInviteUri,
-        title: 'Veil Cryptographic Invitation',
-      });
-    } catch {
-      /* ignore */
-    }
-  };
-
-  const handleImportInvite = () => {
-    setImportError(null);
-    if (!importUri.trim()) return;
-
-    const parsed = parseInvite(importUri.trim());
-    if (!parsed) {
-      setImportError('Invalid or expired invitation URI');
-      return;
-    }
-
+  const handlePairSuccess = (parsedInvite: ParsedInvite) => {
     try {
       const { thread } = contactManager.createFromInvite(
-        parsed,
+        parsedInvite,
         activeMask?.index ?? 0,
       );
       setShowInviteModal(false);
-      setImportUri('');
-      setGeneratedInviteUri(null);
       loadThreads();
       navigation.navigate('Chat', {
         threadId: thread.id,
         contactId: thread.contactId,
       });
     } catch (err: any) {
-      setImportError(err?.message ?? 'Failed to import invite');
+      console.error('[ThreadList] Pair error:', err);
     }
   };
 
@@ -156,203 +136,132 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
     <View style={styles.root}>
       <PrismBackdrop />
       <SafeAreaView style={styles.safe}>
-        {/* Top App Bar */}
-        <View style={styles.header}>
-          <View style={styles.headerLeft}>
-            <Text style={[Type.h1, styles.brandTitle]}>VEIL</Text>
-            <View style={styles.statusRow}>
-              <View
-                style={[
-                  styles.statusDot,
-                  relayStatus === 'connected'
-                    ? styles.statusOnline
-                    : relayStatus === 'connecting'
-                    ? styles.statusConnecting
-                    : styles.statusOffline,
-                ]}
+        <View style={styles.responsiveShell}>
+          {/* Top App Bar */}
+          <View style={styles.header}>
+            <View style={styles.headerLeft}>
+              <Text style={[Type.h1, styles.brandTitle]}>VEIL</Text>
+              <CryptoLabel variant="cyan" size="xs">
+                OBSIDIAN PRISM LENS
+              </CryptoLabel>
+            </View>
+
+            <View style={styles.headerRight}>
+              <PrismButton
+                title="+ INVITE"
+                variant="primary"
+                size="sm"
+                onPress={handleOpenInvite}
+                style={styles.headerBtn}
               />
-              <Text style={Type.hudLabel}>
-                {relayStatus === 'connected' ? 'RELAY LIVE' : relayStatus.toUpperCase()}
-              </Text>
+
+              <PrismButton
+                title="⚿ LOCK"
+                variant="ghost"
+                size="sm"
+                onPress={handleLock}
+                style={styles.headerBtn}
+              />
             </View>
           </View>
 
-          <View style={styles.headerRight}>
-            <Pressable
-              onPress={handleCreateInvite}
-              style={({ pressed }) => [styles.iconBtn, pressed && styles.btnPressed]}
-              accessibilityLabel="Create or import invitation"
-            >
-              <SpecularGlass />
-              <Text style={styles.iconBtnText}>+</Text>
-            </Pressable>
+          {/* Compact Identity Telemetry Header */}
+          {activeMask && (
+            <MaskHeader
+              maskLabel={activeMask.index === 0 ? 'PERSONAL' : 'GHOST'}
+              fingerprint={activeMask.fingerprint}
+              relayStatus={relayStatus}
+              deviceFingerprint={identityManager.getDeviceFingerprint()}
+            />
+          )}
 
-            <Pressable
-              onPress={handleLock}
-              style={({ pressed }) => [styles.iconBtn, pressed && styles.btnPressed]}
-              accessibilityLabel="Lock vault"
-            >
-              <SpecularGlass />
-              <Text style={styles.iconBtnText}>⚿</Text>
-            </Pressable>
-          </View>
-        </View>
+          {/* Active Conversation Threads */}
+          <FlatList
+            data={threads}
+            keyExtractor={(item) => item.id}
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.listContent}
+            renderItem={({ item }) => {
+              const alias = item.contact?.alias ?? 'Unknown Peer';
+              const fp = item.contact?.fingerprint ?? '';
+              const verified = item.contact?.verificationState === 'VERIFIED';
+              const retention = item.defaultRetention ?? 'persistent';
 
-        {/* Identity HUD Card */}
-        {activeMask && (
-          <View style={styles.identityCard}>
-            <BlurView {...Blur.surface} style={StyleSheet.absoluteFill} />
-            <SpecularGlass />
-            <View style={styles.idCardHeader}>
-              <Text style={[Type.hudLabel, { color: Palette.prismLime }]}>
-                MASK · PERSONAL
-              </Text>
-              <Text style={Type.hudLabel}>
-                DEVICE {identityManager.getDeviceFingerprint()}
-              </Text>
-            </View>
-            <Text style={[Type.fingerprint, styles.idFp]}>
-              {activeMask.fingerprint}
-            </Text>
-          </View>
-        )}
+              const retentionDotColor =
+                retention === 'viewOnce'
+                  ? Palette.prismMagenta
+                  : retention === 'timed'
+                  ? Palette.prismAmber
+                  : Palette.prismEmerald;
 
-        {/* Conversation Threads */}
-        <FlatList
-          data={threads}
-          keyExtractor={(item) => item.id}
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={styles.listContent}
-          renderItem={({ item }) => {
-            const alias = item.contact?.alias ?? 'Unknown Peer';
-            const fp = item.contact?.fingerprint ?? '';
-            const verified = item.contact?.verificationState === 'VERIFIED';
-
-            return (
-              <Pressable
-                onPress={() => {
-                  try {
-                    Haptics.selectionAsync().catch(() => {});
-                  } catch {
-                    /* ignore */
-                  }
-                  navigation.navigate('Chat', {
-                    threadId: item.id,
-                    contactId: item.contactId,
-                  });
-                }}
-                style={({ pressed }) => [
-                  styles.threadItem,
-                  pressed && styles.threadItemPressed,
-                ]}
-              >
-                <BlurView {...Blur.surface} style={StyleSheet.absoluteFill} />
-                <SpecularGlass />
-                <View style={styles.threadRow}>
-                  <View style={styles.threadAvatar}>
+              return (
+                <PrismSurface
+                  interactive
+                  onPress={() => {
+                    navigation.navigate('Chat', {
+                      threadId: item.id,
+                      contactId: item.contactId,
+                    });
+                  }}
+                  style={styles.threadItem}
+                  contentStyle={styles.threadInner}
+                  radius={Radius.md}
+                  tint={withAlpha(Palette.glassObsidian, 0.6)}
+                >
+                  <View style={styles.avatarPlate}>
                     <Text style={styles.avatarLetter}>
                       {alias.slice(0, 1).toUpperCase()}
                     </Text>
+                    <View
+                      style={[
+                        styles.retentionDot,
+                        { backgroundColor: retentionDotColor },
+                      ]}
+                    />
                   </View>
+
                   <View style={styles.threadInfo}>
                     <View style={styles.threadTopLine}>
-                      <Text style={Type.h2}>{alias}</Text>
+                      <Text style={[Type.h2, styles.aliasText]}>{alias}</Text>
                       {verified && (
                         <View style={styles.verifiedBadge}>
                           <Text style={styles.verifiedText}>✓ VERIFIED</Text>
                         </View>
                       )}
                     </View>
-                    <Text style={Type.fingerprint} numberOfLines={1}>
-                      {fp}
-                    </Text>
+
+                    <FingerprintDisplay
+                      fingerprint={fp}
+                      truncate
+                      size="sm"
+                      style={{ marginTop: 2 }}
+                    />
                   </View>
+
                   {item.unreadCount > 0 && (
                     <View style={styles.unreadPill}>
                       <Text style={styles.unreadText}>{item.unreadCount}</Text>
                     </View>
                   )}
-                </View>
-              </Pressable>
-            );
-          }}
-          ListEmptyComponent={
-            <View style={styles.emptyContainer}>
-              <Text style={[Type.h2, styles.emptyTitle]}>No Active Channels</Text>
-              <Text style={[Type.body, styles.emptySubtitle]}>
-                Create an invitation to establish a cryptographically paired conversation.
-              </Text>
-            </View>
-          }
-        />
+                </PrismSurface>
+              );
+            }}
+            ListEmptyComponent={
+              <EmptyState
+                onInvitePress={handleOpenInvite}
+                onImportPress={handleOpenInvite}
+              />
+            }
+          />
 
-        {/* Invitation Modal */}
-        <Modal
-          visible={showInviteModal}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setShowInviteModal(false)}
-        >
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalCard}>
-              <BlurView {...Blur.chrome} style={StyleSheet.absoluteFill} />
-              <SpecularGlass />
-
-              <Text style={[Type.h2, styles.modalTitle]}>INVITATIONS</Text>
-
-              {generatedInviteUri && (
-                <View style={styles.inviteSection}>
-                  <Text style={[Type.hudLabel, { color: Palette.prismCyan }]}>
-                    YOUR INVITATION LINK (EXPIRES 1 HR)
-                  </Text>
-                  <View style={styles.uriBox}>
-                    <Text style={[Type.meta, styles.uriText]} numberOfLines={2}>
-                      {generatedInviteUri}
-                    </Text>
-                  </View>
-                  <Pressable
-                    onPress={handleShareInvite}
-                    style={styles.shareBtn}
-                  >
-                    <Text style={styles.shareBtnText}>SHARE INVITATION</Text>
-                  </Pressable>
-                </View>
-              )}
-
-              <View style={styles.importSection}>
-                <Text style={[Type.hudLabel, { color: Palette.prismLime }]}>
-                  IMPORT PEER INVITATION
-                </Text>
-                <TextInput
-                  value={importUri}
-                  onChangeText={setImportUri}
-                  placeholder="veil://invite?v=1&ik=..."
-                  placeholderTextColor={Palette.textMuted}
-                  style={styles.importInput}
-                  autoCapitalize="none"
-                />
-                {importError && (
-                  <Text style={[Type.meta, { color: Palette.danger, marginTop: 4 }]}>
-                    {importError}
-                  </Text>
-                )}
-                <Pressable
-                  onPress={handleImportInvite}
-                  style={styles.importBtn}
-                >
-                  <Text style={styles.importBtnText}>PAIR WITH CONTACT</Text>
-                </Pressable>
-              </View>
-
-              <Pressable
-                onPress={() => setShowInviteModal(false)}
-                style={styles.closeBtn}
-              >
-                <Text style={styles.closeBtnText}>CLOSE</Text>
-              </Pressable>
-            </View>
-          </View>
-        </Modal>
+          {/* Polished Invitation Modal */}
+          <InviteModal
+            visible={showInviteModal}
+            inviteUri={generatedInviteUri}
+            onClose={() => setShowInviteModal(false)}
+            onPairSuccess={handlePairSuccess}
+          />
+        </View>
       </SafeAreaView>
     </View>
   );
@@ -361,162 +270,114 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Palette.voidMidnight },
   safe: { flex: 1 },
+  responsiveShell: {
+    flex: 1,
+    width: '100%',
+    maxWidth: 540,
+    alignSelf: 'center',
+  },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: Space.lg,
-    paddingVertical: Space.sm,
+    paddingHorizontal: Space.md,
+    paddingTop: Space.xs,
+    paddingBottom: Space.xs,
   },
-  headerLeft: { flexDirection: 'column' },
+  headerLeft: {
+    flexDirection: 'column',
+  },
   brandTitle: {
     fontSize: 22,
     lineHeight: 26,
     color: Palette.prismCyan,
-    letterSpacing: 2,
+    letterSpacing: 3,
   },
-  statusRow: { flexDirection: 'row', alignItems: 'center', marginTop: 3 },
-  statusDot: { width: 6, height: 6, borderRadius: 3, marginRight: 6 },
-  statusOnline: { backgroundColor: Palette.prismEmerald, ...glow(Palette.prismEmerald, 6) },
-  statusConnecting: { backgroundColor: Palette.prismAmber },
-  statusOffline: { backgroundColor: Palette.textMuted },
-  headerRight: { flexDirection: 'row', gap: Space.sm },
-  iconBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: Radius.bubble,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.glassObsidian, 0.6),
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
-  },
-  btnPressed: {
-    backgroundColor: withAlpha(Palette.prismCyan, 0.2),
-  },
-  iconBtnText: {
-    fontSize: 18,
-    color: Palette.prismCyan,
-    lineHeight: 22,
-  },
-  identityCard: {
-    marginHorizontal: Space.lg,
-    marginVertical: Space.sm,
-    padding: Space.md,
-    borderRadius: Radius.md,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.voidTrench, 0.6),
-    overflow: 'hidden',
-  },
-  idCardHeader: {
+  headerRight: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: Space.xs,
+    gap: Space.xs,
+    alignItems: 'center',
   },
-  idFp: { fontSize: 11, letterSpacing: 1.2 },
-  listContent: { paddingHorizontal: Space.lg, paddingBottom: Space.xl },
+  headerBtn: {
+    minWidth: 72,
+  },
+  listContent: {
+    paddingHorizontal: Space.md,
+    paddingBottom: Space.xl,
+  },
   threadItem: {
     marginVertical: Space.xs,
-    borderRadius: Radius.md,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.glassObsidian, 0.5),
+  },
+  threadInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
     padding: Space.md,
-    overflow: 'hidden',
   },
-  threadItemPressed: {
-    borderColor: Borders.activeHigh,
-  },
-  threadRow: { flexDirection: 'row', alignItems: 'center' },
-  threadAvatar: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+  avatarPlate: {
+    width: 42,
+    height: 42,
+    borderRadius: Radius.sm,
     borderWidth: Borders.width,
     borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.glassElevated, 0.8),
+    backgroundColor: withAlpha(Palette.voidTrench, 0.7),
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: Space.md,
+    position: 'relative',
   },
-  avatarLetter: { color: Palette.prismCyan, fontSize: 18, fontWeight: 'bold' },
-  threadInfo: { flex: 1 },
-  threadTopLine: { flexDirection: 'row', alignItems: 'center', gap: Space.sm },
+  avatarLetter: {
+    color: Palette.prismCyan,
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  retentionDot: {
+    position: 'absolute',
+    bottom: -2,
+    right: -2,
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    borderWidth: 1,
+    borderColor: Palette.voidMidnight,
+  },
+  threadInfo: {
+    flex: 1,
+  },
+  threadTopLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.xs + 2,
+  },
+  aliasText: {
+    fontSize: 15,
+    color: Palette.textPrimary,
+  },
   verifiedBadge: {
     backgroundColor: withAlpha(Palette.prismLime, 0.15),
     paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: Radius.sm,
+    paddingVertical: 1,
+    borderRadius: 4,
+    borderWidth: Borders.width,
+    borderColor: withAlpha(Palette.prismLime, 0.3),
   },
-  verifiedText: { color: Palette.prismLime, fontSize: 9, fontFamily: 'monospace' },
+  verifiedText: {
+    color: Palette.prismLime,
+    fontSize: 8.5,
+    fontFamily: 'monospace',
+    letterSpacing: 1,
+  },
   unreadPill: {
     backgroundColor: Palette.prismCyan,
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: Radius.pill,
+    ...glow(Palette.prismCyan, 6),
   },
-  unreadText: { color: Palette.textInverse, fontSize: 11, fontWeight: 'bold' },
-  emptyContainer: { alignItems: 'center', marginTop: Space.xxl, paddingHorizontal: Space.xl },
-  emptyTitle: { color: Palette.textHud, marginBottom: Space.xs },
-  emptySubtitle: { color: Palette.textMuted, textAlign: 'center', fontSize: 13 },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(5, 6, 16, 0.8)',
-    justifyContent: 'center',
-    padding: Space.xl,
-  },
-  modalCard: {
-    borderRadius: Radius.md,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.voidMidnight, 0.95),
-    padding: Space.lg,
-    overflow: 'hidden',
-  },
-  modalTitle: { color: Palette.prismCyan, textAlign: 'center', marginBottom: Space.md },
-  inviteSection: { marginBottom: Space.lg },
-  uriBox: {
-    backgroundColor: withAlpha(Palette.voidTrench, 0.7),
-    padding: Space.sm,
-    borderRadius: Radius.sm,
-    marginVertical: Space.xs,
-  },
-  uriText: { color: Palette.textPrimary, fontSize: 10 },
-  shareBtn: {
-    backgroundColor: withAlpha(Palette.prismCyan, 0.2),
-    borderWidth: Borders.width,
-    borderColor: Borders.activeHigh,
-    paddingVertical: Space.sm,
-    borderRadius: Radius.sm,
-    alignItems: 'center',
-    marginTop: Space.xs,
-  },
-  shareBtnText: { color: Palette.prismCyan, fontSize: 11, fontWeight: 'bold' },
-  importSection: { marginBottom: Space.lg },
-  importInput: {
-    backgroundColor: withAlpha(Palette.voidTrench, 0.7),
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    color: Palette.textPrimary,
+  unreadText: {
+    color: Palette.textInverse,
     fontSize: 11,
-    padding: Space.sm,
-    borderRadius: Radius.sm,
-    marginVertical: Space.xs,
+    fontWeight: 'bold',
   },
-  importBtn: {
-    backgroundColor: withAlpha(Palette.prismLime, 0.2),
-    borderWidth: Borders.width,
-    borderColor: withAlpha(Palette.prismLime, 0.5),
-    paddingVertical: Space.sm,
-    borderRadius: Radius.sm,
-    alignItems: 'center',
-    marginTop: Space.xs,
-  },
-  importBtnText: { color: Palette.prismLime, fontSize: 11, fontWeight: 'bold' },
-  closeBtn: { alignItems: 'center', paddingVertical: Space.sm },
-  closeBtnText: { color: Palette.textMuted, fontSize: 12 },
 });
 
 export default ThreadListScreen;

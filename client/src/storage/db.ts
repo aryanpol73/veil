@@ -263,7 +263,16 @@ export const getSession = (): VaultSession | null =>
 
 const CANARY_PLAINTEXT = utf8('veil.canary.v1');
 
-function applyPragmas(conn: SqlConnection): void {
+function applyPragmas(conn: SqlConnection, rawKey?: Uint8Array): void {
+  if (rawKey && rawKey.length > 0) {
+    try {
+      // Pass vault key directly to native SQLCipher codec engine when linked
+      conn.execute(`PRAGMA key = "x'${toHex(rawKey)}'"`);
+      conn.execute('PRAGMA cipher_page_size = 4096');
+    } catch {
+      /* ignore if running in-memory or standard SQLite without codec */
+    }
+  }
   for (const p of PRAGMAS) conn.execute(p);
 }
 
@@ -276,7 +285,7 @@ function tryOpen(partition: Partition, rawKey: Uint8Array): SqlConnection | null
   let conn: SqlConnection | null = null;
   try {
     conn = driver.open(FILES[partition]);
-    applyPragmas(conn);
+    applyPragmas(conn, rawKey);
 
     const res = conn.execute<{ value: string }>(
       'SELECT value FROM meta WHERE key = ?',
@@ -615,7 +624,7 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
 
   try {
     const primary = driver.open(FILES.primary);
-    applyPragmas(primary);
+    applyPragmas(primary, primaryKey);
     migrate(primary);
 
     // Sealed canary for primary
@@ -642,7 +651,7 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
     ]);
 
     const decoy = driver.open(FILES.decoy);
-    applyPragmas(decoy);
+    applyPragmas(decoy, decoyKey);
     migrate(decoy);
 
     // Sealed canary for decoy
@@ -712,7 +721,18 @@ export function isProvisioned(): boolean {
     ).rows;
     conn.close();
     return !!(rows && rows.length > 0 && rows[0].value);
-  } catch {
+  } catch (err: any) {
+    // Under native SQLCipher, querying an encrypted database without the key
+    // throws SQLITE_NOTADB ("file is not a database"). That error confirms
+    // the encrypted vault file exists!
+    const msg = String(err?.message ?? '');
+    if (
+      msg.includes('file is not a database') ||
+      msg.includes('SQLITE_NOTADB') ||
+      msg.includes('not a database')
+    ) {
+      return true;
+    }
     return false;
   }
 }
@@ -996,15 +1016,23 @@ export async function unlockWithPin(pin: string): Promise<UnlockResult> {
   let opened: { conn: SqlConnection; partition: Partition } | null = null;
   let activeKey: Uint8Array | null = null;
   try {
+    // Constant-work execution: attempt to open and authenticate both partitions
+    // unconditionally on every PIN attempt so timing does not leak whether
+    // Master PIN or Ghost PIN was entered.
     const p = tryOpen('primary', primaryKey);
-    const d = p ? null : tryOpen('decoy', decoyKey);
+    const d = tryOpen('decoy', decoyKey);
 
-    if (p) {
+    if (p && !d) {
       opened = { conn: p, partition: 'primary' };
       activeKey = new Uint8Array(primaryKey);
-    } else if (d) {
+    } else if (d && !p) {
       opened = { conn: d, partition: 'decoy' };
       activeKey = new Uint8Array(decoyKey);
+    } else if (p && d) {
+      // Collision / degenerate state (should never occur with distinct salts/labels)
+      try { p.close(); } catch {}
+      try { d.close(); } catch {}
+      return { ok: false };
     }
     if (!opened || !activeKey) return { ok: false };
 

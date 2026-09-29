@@ -532,31 +532,46 @@ const FrostedHeader: React.FC<{
       <BlurView {...Blur.chrome} style={StyleSheet.absoluteFill} />
       <View style={[StyleSheet.absoluteFill, { backgroundColor: Blur.scrim }]} />
       <Specular />
-      <View style={styles.headerRow}>
-        <Pressable onPress={onBack} hitSlop={14} style={styles.backBtn}>
-          <Text style={[Type.h2, { color: Palette.prismCyan }]}>‹</Text>
-        </Pressable>
+      <View style={styles.headerInner}>
+        <View style={styles.headerRow}>
+          <Pressable
+            onPress={onBack}
+            hitSlop={14}
+            style={styles.backBtn}
+            accessibilityRole="button"
+            accessibilityLabel="Back to channels"
+          >
+            <Text style={[Type.h2, { color: Palette.prismCyan }]}>‹</Text>
+          </Pressable>
 
-        <View style={styles.headerCenter}>
-          <Text style={Type.h2} numberOfLines={1}>
-            {alias}
-          </Text>
-          <View style={styles.fpRow}>
-            <View
-              style={[
-                styles.microDot,
-                { backgroundColor: verified ? Palette.prismLime : Palette.textMuted },
-              ]}
-            />
-            <Text style={Type.fingerprint} numberOfLines={1}>
-              {fingerprint}
-            </Text>
+          <View style={styles.headerCenter}>
+            <View style={styles.aliasRow}>
+              <Text style={Type.h2} numberOfLines={1}>
+                {alias}
+              </Text>
+              {verified && (
+                <View style={styles.verifiedBadge}>
+                  <Text style={styles.verifiedText}>✓ VERIFIED</Text>
+                </View>
+              )}
+            </View>
+            <View style={styles.fpRow}>
+              <View
+                style={[
+                  styles.microDot,
+                  { backgroundColor: verified ? Palette.prismLime : Palette.textMuted },
+                ]}
+              />
+              <Text style={Type.fingerprint} numberOfLines={1}>
+                {fingerprint}
+              </Text>
+            </View>
           </View>
-        </View>
 
-        <View style={styles.maskChip}>
-          <Specular />
-          <Text style={Type.hudLabel}>{maskLabel}</Text>
+          <View style={styles.maskChip}>
+            <Specular />
+            <Text style={Type.hudLabel}>MASK · {maskLabel.toUpperCase()}</Text>
+          </View>
         </View>
       </View>
     </View>
@@ -640,85 +655,91 @@ const Composer: React.FC<{
       <View style={[StyleSheet.absoluteFill, { backgroundColor: Blur.scrim }]} />
       <Specular />
 
-      <View style={styles.pillRow}>
-        {MODES.map((m) => (
-          <RetentionPill key={m} mode={m} selected={mode === m} onPress={() => onModeChange(m)} />
-        ))}
-      </View>
-
-      {/* TTL selector appears only for Timed — no dead controls on screen. */}
-      {mode === 'timed' && (
-        <View style={styles.ttlRow}>
-          {TTL_PRESETS.map((ms) => (
-            <Pressable
-              key={ms}
-              onPress={() => {
-                haptic('selection');
-                onTtlChange(ms);
-              }}
-              style={[
-                styles.ttlChip,
-                ttlMs === ms && { borderColor: withAlpha(Retention.timed.accent, 0.5) },
-              ]}
-            >
-              <Text
-                style={[
-                  Type.meta,
-                  ttlMs === ms && { color: Retention.timed.accent },
-                ]}
-              >
-                {formatRemaining(ms)}
-              </Text>
-            </Pressable>
+      <View style={styles.composerInner}>
+        <View style={styles.pillRow}>
+          {MODES.map((m) => (
+            <RetentionPill key={m} mode={m} selected={mode === m} onPress={() => onModeChange(m)} />
           ))}
         </View>
-      )}
 
-      <View style={[styles.inputRow, focused && Surface.activeEdge]}>
-        <Specular active={focused} />
-        <TextInput
-          value={text}
-          onChangeText={setText}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
-          placeholder={
-            mode === 'viewOnce' ? 'Ephemeral — leaves no trace…' : 'Encrypted message…'
-          }
-          placeholderTextColor={Palette.textMuted}
-          style={[Type.input, styles.input]}
-          multiline
-          maxLength={4000}
-          // No predictive text: the keyboard's learning cache is an off-app
-          // plaintext store and defeats the entire retention model.
-          autoCorrect={false}
-          spellCheck={false}
-          keyboardAppearance="dark"
-          textContentType="none"
-        />
-        <Pressable
-          onPressIn={() => {
-            sendScale.value = withSpring(1, Motion.tactile);
-          }}
-          onPressOut={() => {
-            sendScale.value = withSpring(0, Motion.tactile);
-          }}
-          onPress={submit}
-          disabled={!canSend}
-          hitSlop={10}
-        >
-          <Animated.View
-            style={[
-              styles.sendBtn,
-              { backgroundColor: withAlpha(Retention[mode].accent, 0.16) },
-              glow(Retention[mode].edgeGlow, 12),
-              sendStyle,
-            ]}
+        {/* TTL selector appears only for Timed — no dead controls on screen. */}
+        {mode === 'timed' && (
+          <View style={styles.ttlRow}>
+            {TTL_PRESETS.map((ms) => (
+              <Pressable
+                key={ms}
+                onPress={() => {
+                  haptic('selection');
+                  onTtlChange(ms);
+                }}
+                style={[
+                  styles.ttlChip,
+                  ttlMs === ms && { borderColor: withAlpha(Retention.timed.accent, 0.5) },
+                ]}
+              >
+                <Text
+                  style={[
+                    Type.meta,
+                    ttlMs === ms && { color: Retention.timed.accent },
+                  ]}
+                >
+                  {formatRemaining(ms)}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        <View style={[styles.inputRow, focused && Surface.activeEdge]}>
+          <Specular active={focused} />
+          <TextInput
+            value={text}
+            onChangeText={setText}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            placeholder={
+              mode === 'viewOnce'
+                ? '✦ View-Once: burned on release…'
+                : mode === 'timed'
+                ? '◷ Timed: armed on read…'
+                : '▣ Persistent encrypted message…'
+            }
+            placeholderTextColor={Palette.textMuted}
+            style={[Type.input, styles.input]}
+            multiline
+            maxLength={4000}
+            autoCorrect={false}
+            spellCheck={false}
+            keyboardAppearance="dark"
+            textContentType="none"
+          />
+          <Pressable
+            onPressIn={() => {
+              sendScale.value = withSpring(1, Motion.tactile);
+            }}
+            onPressOut={() => {
+              sendScale.value = withSpring(0, Motion.tactile);
+            }}
+            onPress={submit}
+            disabled={!canSend}
+            hitSlop={10}
+            accessibilityRole="button"
+            accessibilityLabel="Send encrypted message"
           >
-            <Text style={[Type.hudLabel, { color: Retention[mode].accent, letterSpacing: 0 }]}>
-              ➤
-            </Text>
-          </Animated.View>
-        </Pressable>
+            <Animated.View
+              style={[
+                styles.sendBtn,
+                { backgroundColor: withAlpha(Retention[mode].accent, 0.16) },
+                glow(Retention[mode].edgeGlow, 12),
+                sendStyle,
+              ]}
+            >
+              <Text style={[Type.hudLabel, { color: Retention[mode].accent, letterSpacing: 0 }]}>
+                ➤
+              </Text>
+            </Animated.View>
+          </Pressable>
+        </View>
       </View>
     </View>
   );
@@ -966,7 +987,14 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Palette.voidMidnight },
   flex: { flex: 1 },
-  listContent: { paddingTop: Space.md, paddingBottom: 140, paddingHorizontal: Space.md },
+  listContent: {
+    paddingTop: Space.md,
+    paddingBottom: 140,
+    paddingHorizontal: Space.md,
+    maxWidth: 680,
+    width: '100%',
+    alignSelf: 'center',
+  },
 
   /* Header */
   header: {
@@ -979,9 +1007,33 @@ const styles = StyleSheet.create({
     borderBottomColor: Borders.specularLow,
     overflow: 'hidden',
   },
+  headerInner: {
+    maxWidth: 680,
+    width: '100%',
+    alignSelf: 'center',
+  },
   headerRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: Space.md },
   backBtn: { width: 28, alignItems: 'flex-start' },
   headerCenter: { flex: 1 },
+  aliasRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Space.xs + 2,
+  },
+  verifiedBadge: {
+    backgroundColor: withAlpha(Palette.prismLime, 0.15),
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 3,
+    borderWidth: Borders.width,
+    borderColor: withAlpha(Palette.prismLime, 0.3),
+  },
+  verifiedText: {
+    color: Palette.prismLime,
+    fontSize: 8.5,
+    fontFamily: 'monospace',
+    letterSpacing: 1,
+  },
   fpRow: { flexDirection: 'row', alignItems: 'center', marginTop: 3 },
   maskChip: {
     paddingHorizontal: Space.sm,
@@ -1033,6 +1085,11 @@ const styles = StyleSheet.create({
     borderTopWidth: Borders.hairWidth,
     borderTopColor: Borders.specularLow,
     overflow: 'hidden',
+  },
+  composerInner: {
+    maxWidth: 680,
+    width: '100%',
+    alignSelf: 'center',
   },
   pillRow: { flexDirection: 'row', gap: Space.sm, marginBottom: Space.sm },
   pill: {

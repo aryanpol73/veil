@@ -17,8 +17,8 @@ import {
   TextInput,
   Pressable,
   ActivityIndicator,
+  Platform,
 } from 'react-native';
-import { BlurView } from 'expo-blur';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import {
@@ -27,12 +27,12 @@ import {
   Borders,
   Space,
   Radius,
-  Blur,
   withAlpha,
   glow,
 } from '../theme/obsidianPrism';
 import PrismBackdrop from '../components/PrismBackdrop';
-import SpecularGlass from '../components/SpecularGlass';
+import PrismSurface from '../components/PrismSurface';
+import CryptoLabel from '../components/CryptoLabel';
 import {
   unlockWithPin,
   activeMaskIndex,
@@ -59,20 +59,24 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
     try {
       const res = await unlockWithPin(enteredPin);
       if (!res.ok) {
-        try {
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-        } catch {
-          /* ignore */
+        if (Platform.OS !== 'web') {
+          try {
+            await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+          } catch {
+            /* ignore */
+          }
         }
         setError('AUTHENTICATION FAILED');
         setPin('');
         return;
       }
 
-      try {
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      } catch {
-        /* ignore */
+      if (Platform.OS !== 'web') {
+        try {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        } catch {
+          /* ignore */
+        }
       }
 
       // Load sealed master seed for this partition
@@ -94,10 +98,12 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
   const handleKeyPress = (num: string) => {
     if (loading) return;
     setError(null);
-    try {
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-    } catch {
-      /* ignore */
+    if (Platform.OS !== 'web') {
+      try {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+      } catch {
+        /* ignore */
+      }
     }
 
     const next = pin + num;
@@ -109,10 +115,12 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
 
   const handleDelete = () => {
     if (loading || pin.length === 0) return;
-    try {
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-    } catch {
-      /* ignore */
+    if (Platform.OS !== 'web') {
+      try {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+      } catch {
+        /* ignore */
+      }
     }
     setPin(pin.slice(0, -1));
   };
@@ -121,93 +129,126 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
     <View style={styles.root}>
       <PrismBackdrop />
       <SafeAreaView style={styles.safe}>
-        <View style={styles.header}>
-          <Text style={[Type.h1, styles.title]}>VEIL</Text>
-          <Text style={[Type.hudLabel, styles.subtitle]}>
-            OBSIDIAN CRYPTOGRAPHIC LENS
-          </Text>
-        </View>
+        <View style={styles.responsiveShell}>
+          {/* Header */}
+          <View style={styles.header}>
+            <Text style={[Type.h1, styles.title]}>VEIL</Text>
+            <CryptoLabel variant="cyan" size="xs" containerStyle={{ marginTop: 4 }}>
+              OBSIDIAN CRYPTOGRAPHIC LENS
+            </CryptoLabel>
+            <Text style={styles.subtitle}>
+              DUAL PARTITION VAULT ACCESS
+            </Text>
+          </View>
 
-        {/* PIN Indicators */}
-        <View style={styles.indicatorContainer}>
-          <View style={styles.dotRow}>
-            {[0, 1, 2, 3, 4, 5].map((idx) => (
-              <View
-                key={idx}
-                style={[
-                  styles.dot,
-                  idx < pin.length && styles.dotFilled,
-                  error && styles.dotError,
-                ]}
-              />
+          {/* PIN Indicators Plate */}
+          <View style={styles.indicatorContainer}>
+            <PrismSurface
+              radius={Radius.pill}
+              style={styles.indicatorPlate}
+              contentStyle={styles.dotRow}
+              tint={withAlpha(Palette.voidTrench, 0.7)}
+            >
+              {[0, 1, 2, 3, 4, 5].map((idx) => (
+                <View
+                  key={idx}
+                  style={[
+                    styles.dot,
+                    idx < pin.length && styles.dotFilled,
+                    error && styles.dotError,
+                  ]}
+                />
+              ))}
+            </PrismSurface>
+
+            {error && (
+              <CryptoLabel variant="magenta" size="xs" containerStyle={{ marginTop: Space.md }}>
+                {error}
+              </CryptoLabel>
+            )}
+
+            {loading && (
+              <View style={styles.loadingContainer}>
+                <ActivityIndicator
+                  color={Palette.prismCyan}
+                  size="small"
+                />
+                <CryptoLabel variant="cyan" size="xs" containerStyle={{ marginTop: Space.xs }}>
+                  DERIVING ARGON2ID KEYS…
+                </CryptoLabel>
+              </View>
+            )}
+          </View>
+
+          {/* Virtual Keypad */}
+          <View style={styles.keypad}>
+            {[
+              ['1', '2', '3'],
+              ['4', '5', '6'],
+              ['7', '8', '9'],
+              ['', '0', '⌫'],
+            ].map((row, rIdx) => (
+              <View key={rIdx} style={styles.keypadRow}>
+                {row.map((btn, bIdx) => {
+                  if (btn === '') {
+                    return <View key={bIdx} style={styles.keyBtnEmpty} />;
+                  }
+                  const isDel = btn === '⌫';
+                  return (
+                    <PrismSurface
+                      key={bIdx}
+                      interactive
+                      onPress={() => (isDel ? handleDelete() : handleKeyPress(btn))}
+                      radius={Radius.bubble}
+                      style={styles.keyBtn}
+                      contentStyle={styles.keyBtnInner}
+                      tint={
+                        isDel
+                          ? withAlpha(Palette.glassShroud, 0.6)
+                          : withAlpha(Palette.glassObsidian, 0.65)
+                      }
+                      active={isDel}
+                      glowColor={isDel ? withAlpha(Palette.prismMagenta, 0.3) : undefined}
+                      accessibilityLabel={isDel ? 'Delete PIN digit' : `Digit ${btn}`}
+                    >
+                      <Text
+                        style={[
+                          Type.h1,
+                          isDel ? styles.delKeyText : styles.keyText,
+                        ]}
+                      >
+                        {btn}
+                      </Text>
+                    </PrismSurface>
+                  );
+                })}
+              </View>
             ))}
           </View>
 
-          {error && <Text style={[Type.meta, styles.errorText]}>{error}</Text>}
-          {loading && (
-            <ActivityIndicator
-              color={Palette.prismCyan}
-              style={{ marginTop: Space.sm }}
-            />
-          )}
-        </View>
+          {/* Coercion Notice */}
+          <View style={styles.footer}>
+            <Text style={styles.footerNote}>
+              Independent Master & Ghost PINs unlock separate partitions with zero forensic linkage.
+            </Text>
+          </View>
 
-        {/* Virtual Keypad */}
-        <View style={styles.keypad}>
-          {[
-            ['1', '2', '3'],
-            ['4', '5', '6'],
-            ['7', '8', '9'],
-            ['', '0', '⌫'],
-          ].map((row, rIdx) => (
-            <View key={rIdx} style={styles.keypadRow}>
-              {row.map((btn, bIdx) => {
-                if (btn === '') {
-                  return <View key={bIdx} style={styles.keyBtnEmpty} />;
-                }
-                const isDel = btn === '⌫';
-                return (
-                  <Pressable
-                    key={bIdx}
-                    onPress={() => (isDel ? handleDelete() : handleKeyPress(btn))}
-                    disabled={loading}
-                    style={({ pressed }) => [
-                      styles.keyBtn,
-                      pressed && styles.keyBtnPressed,
-                    ]}
-                  >
-                    <BlurView {...Blur.surface} style={StyleSheet.absoluteFill} />
-                    <SpecularGlass />
-                    <Text
-                      style={[
-                        Type.h2,
-                        isDel ? styles.delKeyText : styles.keyText,
-                      ]}
-                    >
-                      {btn}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-          ))}
+          {/* Hidden TextInput for accessibility / keyboard input */}
+          <TextInput
+            value={pin}
+            onChangeText={(val) => {
+              const digits = val.replace(/\D/g, '').slice(0, 6);
+              setPin(digits);
+              if (digits.length === 6) handleUnlock(digits);
+            }}
+            keyboardType="numeric"
+            maxLength={6}
+            secureTextEntry
+            style={styles.hiddenInput}
+            autoFocus={false}
+            accessibilityLabel="Enter 6-digit security PIN"
+          />
         </View>
-
-        {/* Hidden TextInput for accessibility and password managers */}
-        <TextInput
-          value={pin}
-          onChangeText={(val) => {
-            const digits = val.replace(/\D/g, '').slice(0, 6);
-            setPin(digits);
-            if (digits.length === 6) handleUnlock(digits);
-          }}
-          keyboardType="numeric"
-          maxLength={6}
-          secureTextEntry
-          style={styles.hiddenInput}
-          autoFocus={false}
-          accessibilityLabel="Enter 6-digit security PIN"
-        />
       </SafeAreaView>
     </View>
   );
@@ -215,64 +256,121 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Palette.voidMidnight },
-  safe: {
+  safe: { flex: 1 },
+  responsiveShell: {
     flex: 1,
+    width: '100%',
+    maxWidth: 420,
+    alignSelf: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: Space.xl,
     paddingVertical: Space.lg,
   },
-  header: { alignItems: 'center', marginTop: Space.xl },
-  title: {
-    fontSize: 28,
-    lineHeight: 34,
-    color: Palette.prismCyan,
-    letterSpacing: 4,
+  header: {
+    alignItems: 'center',
+    marginTop: Space.lg,
   },
-  subtitle: { marginTop: 6, color: Palette.textHud, letterSpacing: 2 },
-  indicatorContainer: { alignItems: 'center', marginVertical: Space.xl },
-  dotRow: { flexDirection: 'row', gap: Space.md },
+  title: {
+    fontSize: 30,
+    lineHeight: 36,
+    color: Palette.prismCyan,
+    letterSpacing: 6,
+  },
+  subtitle: {
+    fontFamily: 'monospace',
+    fontSize: 10,
+    color: Palette.textMuted,
+    letterSpacing: 1.8,
+    marginTop: 6,
+  },
+  indicatorContainer: {
+    alignItems: 'center',
+    marginVertical: Space.md,
+  },
+  indicatorPlate: {
+    paddingHorizontal: Space.lg,
+    paddingVertical: Space.sm + 2,
+    borderWidth: Borders.width,
+    borderColor: Borders.specularLow,
+  },
+  dotRow: {
+    flexDirection: 'row',
+    gap: Space.md,
+    alignItems: 'center',
+  },
   dot: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
     borderWidth: 1.5,
     borderColor: Borders.activeHigh,
     backgroundColor: withAlpha(Palette.voidTrench, 0.4),
   },
   dotFilled: {
     backgroundColor: Palette.prismCyan,
-    ...glow(Palette.prismCyan, 8),
+    borderColor: Palette.prismCyan,
+    ...glow(Palette.prismCyan, 10),
   },
   dotError: {
     borderColor: Palette.danger,
-    backgroundColor: withAlpha(Palette.danger, 0.5),
+    backgroundColor: withAlpha(Palette.danger, 0.6),
   },
-  errorText: { color: Palette.danger, marginTop: Space.md, letterSpacing: 1.2 },
-  keypad: { width: '100%', marginBottom: Space.lg },
+  loadingContainer: {
+    alignItems: 'center',
+    marginTop: Space.md,
+  },
+  keypad: {
+    width: '100%',
+    maxWidth: 320,
+    alignSelf: 'center',
+  },
   keypadRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: Space.md,
+    marginVertical: Space.xs + 2,
   },
   keyBtn: {
-    width: 76,
-    height: 76,
-    borderRadius: Radius.bubble,
+    width: 68,
+    height: 68,
+  },
+  keyBtnInner: {
+    width: '100%',
+    height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.glassObsidian, 0.6),
-    overflow: 'hidden',
   },
-  keyBtnPressed: {
-    backgroundColor: withAlpha(Palette.prismCyan, 0.15),
-    borderColor: Borders.activeHigh,
+  keyBtnEmpty: {
+    width: 68,
+    height: 68,
   },
-  keyBtnEmpty: { width: 76, height: 76 },
-  keyText: { fontSize: 24, lineHeight: 28, color: Palette.textPrimary },
-  delKeyText: { fontSize: 20, color: Palette.textHud },
-  hiddenInput: { position: 'absolute', opacity: 0, width: 0, height: 0 },
+  keyText: {
+    color: Palette.textPrimary,
+    fontSize: 24,
+    lineHeight: 28,
+  },
+  delKeyText: {
+    color: Palette.prismMagenta,
+    fontSize: 20,
+    lineHeight: 24,
+  },
+  footer: {
+    alignItems: 'center',
+    marginTop: Space.sm,
+  },
+  footerNote: {
+    fontFamily: 'monospace',
+    fontSize: 9.5,
+    lineHeight: 14,
+    color: Palette.textMuted,
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+  hiddenInput: {
+    position: 'absolute',
+    opacity: 0,
+    width: 1,
+    height: 1,
+  },
 });
 
 export default UnlockScreen;

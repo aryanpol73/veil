@@ -1,8 +1,8 @@
 /**
  * ============================================================================
- *  VEIL — PROVISION SCREEN (INITIAL DUAL-PARTITION SETUP)
+ *  VEIL — PROVISION SCREEN (OBSIDIAN PRISM)
  * ============================================================================
- *  Creates both primary and decoy vaults simultaneously:
+ *  Initial dual-partition cryptographic setup:
  *   - Generates independent cryptographic master seeds
  *   - Derives Ed25519/X25519 identities for primary and ghost personas
  *   - Sets Master PIN (Primary Vault) and Ghost PIN (Decoy Vault)
@@ -15,12 +15,9 @@ import {
   StyleSheet,
   Text,
   View,
-  TextInput,
-  Pressable,
   ScrollView,
-  ActivityIndicator,
+  Platform,
 } from 'react-native';
-import { BlurView } from 'expo-blur';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import {
@@ -29,12 +26,15 @@ import {
   Borders,
   Space,
   Radius,
-  Blur,
   withAlpha,
   glow,
 } from '../theme/obsidianPrism';
 import PrismBackdrop from '../components/PrismBackdrop';
-import SpecularGlass from '../components/SpecularGlass';
+import PrismSurface from '../components/PrismSurface';
+import PrismButton from '../components/PrismButton';
+import PrismInput from '../components/PrismInput';
+import CryptoLabel from '../components/CryptoLabel';
+import FingerprintDisplay from '../components/FingerprintDisplay';
 import {
   generateMasterSeed,
   deriveMask,
@@ -89,6 +89,10 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
 
     setLoading(true);
     try {
+      if (Platform.OS !== 'web') {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+      }
+
       await provisionVaults({
         masterPin,
         ghostPin,
@@ -121,99 +125,135 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
     <View style={styles.root}>
       <PrismBackdrop />
       <SafeAreaView style={styles.safe}>
-        <ScrollView
-          contentContainerStyle={styles.scrollContent}
-          showsVerticalScrollIndicator={false}
-        >
-          <View style={styles.header}>
-            <Text style={[Type.h1, styles.title]}>INITIALIZE VEIL</Text>
-            <Text style={[Type.hudLabel, styles.subtitle]}>
-              CRYPTOGRAPHIC DUAL-VAULT PROVISIONING
-            </Text>
-          </View>
-
-          <View style={styles.card}>
-            <BlurView {...Blur.surface} style={StyleSheet.absoluteFill} />
-            <SpecularGlass />
-            <Text style={[Type.hudLabel, { color: Palette.prismCyan }]}>
-              DUAL PARTITION ARCHITECTURE
-            </Text>
-            <Text style={[Type.body, styles.infoText]}>
-              Veil initializes two separate vaults in one pass. Your Master PIN
-              unlocks your primary identity. Your Ghost PIN unlocks a plausible decoy
-              vault with simulated history to protect against coercion.
-            </Text>
-          </View>
-
-          {/* Primary Identity Preview */}
-          <View style={styles.section}>
-            <Text style={[Type.hudLabel, styles.sectionHeader]}>
-              PRIMARY IDENTITY FINGERPRINT
-            </Text>
-            <View style={styles.fingerprintBox}>
-              <SpecularGlass />
-              <Text style={Type.fingerprint}>{primaryMask.fingerprint}</Text>
-            </View>
-            <Text style={[Type.hudLabel, styles.inputLabel]}>
-              MASTER PIN (MIN 6 DIGITS)
-            </Text>
-            <TextInput
-              value={masterPin}
-              onChangeText={setMasterPin}
-              keyboardType="numeric"
-              secureTextEntry
-              maxLength={8}
-              placeholder="••••••"
-              placeholderTextColor={Palette.textMuted}
-              style={[Type.input, styles.pinInput]}
-            />
-          </View>
-
-          {/* Ghost Persona Preview */}
-          <View style={styles.section}>
-            <Text style={[Type.hudLabel, styles.sectionHeader]}>
-              GHOST PERSONA FINGERPRINT (DECOY)
-            </Text>
-            <View style={styles.fingerprintBox}>
-              <SpecularGlass />
-              <Text style={Type.fingerprint}>{ghostMask.fingerprint}</Text>
-            </View>
-            <Text style={[Type.hudLabel, styles.inputLabel]}>
-              GHOST PIN (DURESS RECOVERY)
-            </Text>
-            <TextInput
-              value={ghostPin}
-              onChangeText={setGhostPin}
-              keyboardType="numeric"
-              secureTextEntry
-              maxLength={8}
-              placeholder="••••••"
-              placeholderTextColor={Palette.textMuted}
-              style={[Type.input, styles.pinInput]}
-            />
-          </View>
-
-          {error && <Text style={[Type.meta, styles.errorText]}>{error}</Text>}
-
-          <Pressable
-            onPress={handleProvision}
-            disabled={loading}
-            style={({ pressed }) => [
-              styles.submitBtn,
-              pressed && styles.submitBtnPressed,
-              loading && { opacity: 0.6 },
-            ]}
+        <View style={styles.responsiveShell}>
+          <ScrollView
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
           >
-            <SpecularGlass active />
-            {loading ? (
-              <ActivityIndicator color={Palette.textInverse} />
-            ) : (
-              <Text style={[Type.h2, styles.submitBtnText]}>
-                ENGAGE CRYPTOGRAPHIC LENS
+            {/* Header */}
+            <View style={styles.header}>
+              <Text style={[Type.h1, styles.title]}>INITIALIZE VEIL</Text>
+              <CryptoLabel variant="cyan" size="xs" containerStyle={{ marginTop: 4 }}>
+                DUAL-PARTITION CRYPTOGRAPHIC PROVISIONING
+              </CryptoLabel>
+            </View>
+
+            {/* Architecture Overview */}
+            <PrismSurface
+              radius={Radius.md}
+              style={styles.card}
+              contentStyle={styles.cardContent}
+              tint={withAlpha(Palette.voidTrench, 0.75)}
+            >
+              <CryptoLabel variant="lime" dot size="xs">
+                PLAUSIBLE DENIABILITY
+              </CryptoLabel>
+              <Text style={styles.infoText}>
+                Veil provisions two independent SQLite partitions simultaneously. Your Master PIN
+                opens your real persona; your Ghost PIN opens a plausible decoy vault to withstand
+                physical coercion.
               </Text>
+            </PrismSurface>
+
+            {/* Primary Identity Section */}
+            <PrismSurface
+              radius={Radius.md}
+              style={styles.section}
+              contentStyle={styles.sectionContent}
+              tint={withAlpha(Palette.glassObsidian, 0.6)}
+            >
+              <View style={styles.sectionHeaderRow}>
+                <CryptoLabel variant="cyan" dot size="xs">
+                  PRIMARY PARTITION
+                </CryptoLabel>
+                <Text style={styles.badgeText}>MASK 0</Text>
+              </View>
+
+              <Text style={styles.inputPrompt}>Identity Fingerprint</Text>
+              <FingerprintDisplay
+                fingerprint={primaryMask.fingerprint}
+                copyable
+                size="sm"
+                style={styles.fpBox}
+              />
+
+              <PrismInput
+                value={masterPin}
+                onChangeText={(val) => {
+                  setMasterPin(val.replace(/\D/g, '').slice(0, 8));
+                  setError(null);
+                }}
+                label="MASTER SECURITY PIN (MIN 6 DIGITS)"
+                placeholder="Enter 6-8 digit PIN"
+                keyboardType="numeric"
+                secureTextEntry
+                maxLength={8}
+                mono
+                autoFocus
+              />
+            </PrismSurface>
+
+            {/* Ghost Identity Section */}
+            <PrismSurface
+              radius={Radius.md}
+              style={styles.section}
+              contentStyle={styles.sectionContent}
+              tint={withAlpha(Palette.glassShroud, 0.6)}
+              active
+              glowColor={withAlpha(Palette.prismMagenta, 0.2)}
+            >
+              <View style={styles.sectionHeaderRow}>
+                <CryptoLabel variant="magenta" dot size="xs">
+                  GHOST DECOY PARTITION
+                </CryptoLabel>
+                <Text style={styles.badgeTextGhost}>DURESS SAFE</Text>
+              </View>
+
+              <Text style={styles.inputPrompt}>Decoy Persona Fingerprint</Text>
+              <FingerprintDisplay
+                fingerprint={ghostMask.fingerprint}
+                copyable
+                size="sm"
+                style={styles.fpBox}
+              />
+
+              <PrismInput
+                value={ghostPin}
+                onChangeText={(val) => {
+                  setGhostPin(val.replace(/\D/g, '').slice(0, 8));
+                  setError(null);
+                }}
+                label="GHOST RECOVERY PIN (MUST BE DIFFERENT)"
+                placeholder="Enter distinct 6-8 digit PIN"
+                keyboardType="numeric"
+                secureTextEntry
+                maxLength={8}
+                mono
+              />
+            </PrismSurface>
+
+            {error && (
+              <CryptoLabel
+                variant="magenta"
+                size="sm"
+                containerStyle={{ alignSelf: 'center', marginVertical: Space.sm }}
+              >
+                {error}
+              </CryptoLabel>
             )}
-          </Pressable>
-        </ScrollView>
+
+            {/* Submit Action */}
+            <PrismButton
+              title={loading ? 'CALCULATING ARGON2ID PROOF…' : 'ENGAGE CRYPTOGRAPHIC LENS'}
+              variant="primary"
+              size="lg"
+              loading={loading}
+              disabled={loading || masterPin.length < 6 || ghostPin.length < 6}
+              onPress={handleProvision}
+              style={styles.submitBtn}
+            />
+          </ScrollView>
+        </View>
       </SafeAreaView>
     </View>
   );
@@ -222,85 +262,79 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Palette.voidMidnight },
   safe: { flex: 1 },
-  scrollContent: { padding: Space.lg, paddingBottom: Space.xxl },
-  header: { alignItems: 'center', marginVertical: Space.lg },
-  title: {
-    fontSize: 22,
-    lineHeight: 28,
-    color: Palette.prismCyan,
-    letterSpacing: 3,
+  responsiveShell: {
+    flex: 1,
+    width: '100%',
+    maxWidth: 480,
+    alignSelf: 'center',
   },
-  subtitle: { marginTop: 4, color: Palette.textHud, letterSpacing: 1.5 },
+  scrollContent: {
+    paddingHorizontal: Space.lg,
+    paddingTop: Space.md,
+    paddingBottom: Space.xxl,
+  },
+  header: {
+    alignItems: 'center',
+    marginVertical: Space.md,
+  },
+  title: {
+    fontSize: 24,
+    lineHeight: 30,
+    color: Palette.prismCyan,
+    letterSpacing: 4,
+  },
   card: {
-    padding: Space.lg,
-    borderRadius: Radius.md,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.glassObsidian, 0.7),
-    marginBottom: Space.lg,
-    overflow: 'hidden',
+    marginBottom: Space.md,
+  },
+  cardContent: {
+    padding: Space.md,
   },
   infoText: {
-    marginTop: Space.sm,
-    fontSize: 13,
+    fontFamily: 'system-ui, sans-serif',
+    fontSize: 12.5,
     lineHeight: 18,
-    color: Palette.textPrimary,
-  },
-  section: {
-    marginBottom: Space.lg,
-    padding: Space.md,
-    borderRadius: Radius.md,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    backgroundColor: withAlpha(Palette.voidMidnight, 0.6),
-  },
-  sectionHeader: { color: Palette.prismLime, marginBottom: Space.xs },
-  fingerprintBox: {
-    padding: Space.sm,
-    backgroundColor: withAlpha(Palette.voidTrench, 0.6),
-    borderRadius: Radius.sm,
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    alignItems: 'center',
-    marginBottom: Space.sm,
-  },
-  inputLabel: { marginTop: Space.xs, color: Palette.textHud },
-  pinInput: {
-    backgroundColor: withAlpha(Palette.glassElevated, 0.7),
-    borderWidth: Borders.width,
-    borderColor: Borders.specularLow,
-    borderRadius: Radius.sm,
-    paddingHorizontal: Space.md,
-    paddingVertical: Space.sm,
-    color: Palette.prismCyan,
-    fontSize: 18,
-    letterSpacing: 4,
+    color: Palette.textHud,
     marginTop: Space.xs,
   },
-  errorText: {
-    color: Palette.danger,
-    textAlign: 'center',
+  section: {
     marginBottom: Space.md,
+  },
+  sectionContent: {
+    padding: Space.md,
+  },
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: Space.xs,
+  },
+  badgeText: {
+    fontFamily: 'monospace',
+    fontSize: 9,
+    color: Palette.prismCyan,
     letterSpacing: 1,
   },
+  badgeTextGhost: {
+    fontFamily: 'monospace',
+    fontSize: 9,
+    color: Palette.prismMagenta,
+    letterSpacing: 1,
+  },
+  inputPrompt: {
+    fontFamily: 'monospace',
+    fontSize: 10,
+    color: Palette.textMuted,
+    letterSpacing: 1.1,
+    marginTop: Space.xs,
+    marginBottom: 2,
+    textTransform: 'uppercase',
+  },
+  fpBox: {
+    marginBottom: Space.xs,
+  },
   submitBtn: {
-    backgroundColor: Palette.prismCyan,
-    paddingVertical: Space.md,
-    borderRadius: Radius.pill,
-    alignItems: 'center',
-    justifyContent: 'center',
     marginTop: Space.md,
-    ...glow(Palette.prismCyan, 16),
-  },
-  submitBtnPressed: {
-    opacity: 0.85,
-    transform: [{ scale: 0.98 }],
-  },
-  submitBtnText: {
-    color: Palette.textInverse,
-    fontSize: 14,
-    fontWeight: 'bold',
-    letterSpacing: 1.5,
+    marginBottom: Space.xl,
   },
 });
 
