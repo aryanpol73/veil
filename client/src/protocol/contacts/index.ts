@@ -1,8 +1,8 @@
 /**
  * ============================================================================
- *  VEIL — DOUBLE RATCHET (CRYPTO EXPORT SEAM)
+ *  VEIL — CONTACTS EXPORT
  * ============================================================================
  */
 
-export * from '../protocol/ratchet';
-export { default } from '../protocol/ratchet';
+export * from './ContactManager';
+export { default } from './ContactManager';

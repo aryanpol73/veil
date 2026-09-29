@@ -34,7 +34,7 @@
  * ============================================================================
  */
 
-import * as SecureStore from 'expo-secure-store';
+import { Keychain } from './keychain';
 import {
   CRYPTO,
   deriveVaultKey,
@@ -115,13 +115,10 @@ const PARTITION_LABEL: Record<Partition, string> = {
 const SALT_KEY = 'veil.vault.device_salt.v1';
 
 async function loadOrCreateDeviceSalt(): Promise<Uint8Array> {
-  const existing = await SecureStore.getItemAsync(SALT_KEY);
+  const existing = await Keychain.getItem(SALT_KEY);
   if (existing) return fromB64(existing);
   const salt = randomBytes(CRYPTO.VAULT_SALT_BYTES);
-  await SecureStore.setItemAsync(SALT_KEY, toB64(salt), {
-    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-    requireAuthentication: false, // PIN is our factor; biometrics are optional UX
-  });
+  await Keychain.setItem(SALT_KEY, toB64(salt));
   return salt;
 }
 
@@ -511,6 +508,8 @@ export interface ProvisionInput {
   ghostPin: string;
   primaryFingerprint: string;
   ghostFingerprint: string;
+  primarySeed?: Uint8Array;
+  ghostSeed?: Uint8Array;
 }
 
 /**
@@ -530,6 +529,9 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
   const primaryKey = deriveVaultKey(input.masterPin, salt, PARTITION_LABEL.primary);
   const decoyKey = deriveVaultKey(input.ghostPin, salt, PARTITION_LABEL.decoy);
 
+  const pSeed = input.primarySeed ?? randomBytes(CRYPTO.SEED_BYTES);
+  const gSeed = input.ghostSeed ?? randomBytes(CRYPTO.SEED_BYTES);
+
   try {
     const primary = driver.open(FILES.primary);
     applyPragmas(primary);
@@ -547,6 +549,10 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
       [0, 'Personal', input.primaryFingerprint, Date.now()],
     );
+    primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
+      'master_seed',
+      packSealed(aeadEncrypt(primaryKey, pSeed, utf8('master_seed'))),
+    ]);
 
     const decoy = driver.open(FILES.decoy);
     applyPragmas(decoy);
@@ -564,6 +570,10 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
       [1, 'Personal', input.ghostFingerprint, Date.now()],
     );
+    decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
+      'master_seed',
+      packSealed(aeadEncrypt(decoyKey, gSeed, utf8('master_seed'))),
+    ]);
 
     seedDecoy(decoy, decoyKey);
 
@@ -573,6 +583,44 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
     decoy.close();
   } finally {
     wipe(primaryKey, decoyKey);
+  }
+}
+
+export function saveSealedMasterSeed(masterSeed: Uint8Array): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  const sealed = packSealed(
+    aeadEncrypt(active.vaultKey, masterSeed, utf8('master_seed')),
+  );
+  getDb().execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
+    'master_seed',
+    sealed,
+  ]);
+}
+
+export function loadSealedMasterSeed(): Uint8Array | null {
+  if (!active) return null;
+  const rows = getDb().execute<{ value: string }>(
+    'SELECT value FROM meta WHERE key = ?',
+    ['master_seed'],
+  ).rows;
+  if (!rows || rows.length === 0 || !rows[0].value) return null;
+  const sealed = unpackSealed(rows[0].value);
+  if (!sealed) return null;
+  return aeadDecrypt(active.vaultKey, sealed, utf8('master_seed'));
+}
+
+export function isProvisioned(): boolean {
+  try {
+    const conn = driver.open(FILES.primary);
+    applyPragmas(conn);
+    const rows = conn.execute<{ value: string }>(
+      'SELECT value FROM meta WHERE key = ?',
+      ['canary'],
+    ).rows;
+    conn.close();
+    return !!(rows && rows.length > 0 && rows[0].value);
+  } catch {
+    return false;
   }
 }
 
@@ -1027,7 +1075,7 @@ export async function panicWipe(ghostPin: string, ghostFingerprint: string): Pro
       /* already gone */
     }
   }
-  await SecureStore.deleteItemAsync(SALT_KEY);
+  await Keychain.deleteItem(SALT_KEY);
   await provisionVaults({
     masterPin: toB64(randomBytes(24)), // unreachable by design
     ghostPin,
@@ -1053,4 +1101,7 @@ export default {
   setSqlDriver,
   saveRatchet,
   loadRatchet,
+  isProvisioned,
+  saveSealedMasterSeed,
+  loadSealedMasterSeed,
 };

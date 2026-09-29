@@ -35,8 +35,7 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-// Replace: import { Redis } from 'ioredis';
-import RedisMock from 'ioredis-mock';
+import { createRelayBus, type RelayBus, type RelayEnvelope } from './bus.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const _sodium = require('libsodium-wrappers');
@@ -48,6 +47,7 @@ const _sodium = require('libsodium-wrappers');
 const CONFIG = {
   port: Number(process.env.VEIL_PORT ?? 8443),
   redisUrl: process.env.VEIL_REDIS_URL ?? 'redis://127.0.0.1:6379',
+  busType: (process.env.VEIL_BUS === 'redis' ? 'redis' : 'memory') as 'memory' | 'redis',
 
   /** Fixed padded envelope size. Uniformity denies size-correlation attacks. */
   envelopeBytes: 4096,
@@ -163,39 +163,31 @@ function authPreimage(inbox: string, nonce: Buffer): Uint8Array {
 /* Redis pub/sub bus (fan-out only)                                          */
 /* -------------------------------------------------------------------------- */
 
-const CH_DELIVER = 'veil:relay:deliver';
-const CH_ANNOUNCE = 'veil:relay:announce';
-
-const pub = new RedisMock(CONFIG.redisUrl, { lazyConnect: true, enableOfflineQueue: false });
-const sub = new RedisMock(CONFIG.redisUrl, { lazyConnect: true, enableOfflineQueue: false });
+let bus: RelayBus;
 
 /**
- * Cross-node routing, without any shared storage:
+ * Cross-node routing via pluggable RelayBus (InMemoryRelayBus or RedisRelayBus):
  *
- *  - On SEND, the ingress node buffers locally AND publishes on CH_DELIVER.
+ *  - On SEND, the ingress node buffers locally AND publishes on the bus.
  *    Whichever node holds a live subscriber pushes it and returns the ACK,
- *    which is broadcast so the ingress node can drop its copy.
- *  - On SUB, the node publishes on CH_ANNOUNCE. Any node holding buffered mail
+ *    which drops the copy.
+ *  - On SUB, the node announces the inbox. Any node holding buffered mail
  *    for that inbox re-publishes it. That is how an offline client's mail
  *    reaches it after reconnecting to a different node — with zero persistence.
  */
 async function initBus(): Promise<void> {
-  await Promise.all([pub.connect(), sub.connect()]);
-  await sub.subscribe(CH_DELIVER, CH_ANNOUNCE);
+  bus = createRelayBus({ type: CONFIG.busType, redisUrl: CONFIG.redisUrl });
+  log.boot(`bus: ${CONFIG.busType}${CONFIG.busType === 'redis' ? ` (${CONFIG.redisUrl})` : ' (in-memory volatile)'}`);
 
-  sub.on('message', (channel: string, raw: string) => {
-    try {
-      const msg = JSON.parse(raw);
-      if (channel === CH_DELIVER) {
-        // Only act if WE hold a subscriber; otherwise ignore entirely.
-        if (subscribers.has(msg.inbox)) fanOut(msg as Envelope, false);
-      } else if (channel === CH_ANNOUNCE) {
-        flushLocalBuffer(msg.inbox);
-      }
-    } catch {
-      /* malformed bus traffic is discarded silently */
-    }
-  });
+  await bus.subscribe(
+    (envelope: RelayEnvelope) => {
+      // Only act if WE hold a subscriber; otherwise ignore entirely.
+      if (subscribers.has(envelope.inbox)) fanOut(envelope as Envelope, false);
+    },
+    (inbox: string) => {
+      flushLocalBuffer(inbox);
+    },
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -252,7 +244,7 @@ function flushLocalBuffer(inbox: string): void {
   } else {
     // A subscriber exists on another node — hand the mail to the bus.
     for (const e of live) {
-      pub.publish(CH_DELIVER, JSON.stringify(e)).catch(() => {});
+      bus.publishEnvelope(e).catch(() => {});
     }
   }
 }
@@ -336,7 +328,7 @@ function handleSub(conn: Conn, f: Extract<ClientFrame, { t: 'SUB' }>): void {
 
   // Drain anything already here, then ask peer nodes to drain too.
   flushLocalBuffer(f.inbox);
-  pub.publish(CH_ANNOUNCE, JSON.stringify({ inbox: f.inbox })).catch(() => {});
+  bus.announceInbox(f.inbox).catch(() => {});
 }
 
 function handleSend(conn: Conn, f: Extract<ClientFrame, { t: 'SEND' }>): void {
@@ -361,7 +353,7 @@ function handleSend(conn: Conn, f: Extract<ClientFrame, { t: 'SEND' }>): void {
   };
 
   fanOut(envelope, true);
-  pub.publish(CH_DELIVER, JSON.stringify(envelope)).catch(() => {});
+  bus.publishEnvelope(envelope).catch(() => {});
   send(conn, { t: 'ACCEPTED', inbox: f.inbox, id: envelope.id });
 }
 
@@ -421,13 +413,26 @@ function handleFrame(conn: Conn, raw: RawData): void {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Server                                                                     */
+/* Server Lifecycle                                                           */
 /* -------------------------------------------------------------------------- */
 
-async function main(): Promise<void> {
+export interface RelayServerHandle {
+  port: number;
+  url: string;
+  close: () => Promise<void>;
+  http: any;
+  wss: any;
+  bus: RelayBus;
+}
+
+export async function startRelayServer(
+  port: number = CONFIG.port,
+  configOverrides: Partial<typeof CONFIG> = {}
+): Promise<RelayServerHandle> {
+  const cfg = { ...CONFIG, ...configOverrides, port };
   await _sodium.ready;
   sodium = _sodium;
-  await initBus();
+  bus = createRelayBus({ type: cfg.busType, redisUrl: cfg.redisUrl });
 
   // No request logging middleware, deliberately. `/healthz` returns a bare 200
   // with no version string or counters — a fingerprintable banner is metadata.
@@ -443,7 +448,7 @@ async function main(): Promise<void> {
 
   const wss = new WebSocketServer({
     server: http,
-    maxPayload: CONFIG.maxFrameBytes,
+    maxPayload: cfg.maxFrameBytes,
     // Compression OFF: a shared compression context across messages leaks
     // plaintext similarity through ciphertext length (CRIME/BREACH-style).
     perMessageDeflate: false,
@@ -462,7 +467,7 @@ async function main(): Promise<void> {
       ws,
       nonce: randomBytes(32),
       subs: new Set(),
-      tokens: CONFIG.rateBurst,
+      tokens: cfg.rateBurst,
       lastRefill: Date.now(),
       alive: true,
       lastSeen: Date.now(),
@@ -473,7 +478,7 @@ async function main(): Promise<void> {
       t: 'HELLO',
       v: 1,
       nonce: conn.nonce.toString('base64url'),
-      envelopeBytes: CONFIG.envelopeBytes,
+      envelopeBytes: cfg.envelopeBytes,
     });
 
     ws.on('message', (raw) => handleFrame(conn, raw));
@@ -499,7 +504,7 @@ async function main(): Promise<void> {
   const heartbeat = setInterval(() => {
     const now = Date.now();
     for (const conn of conns) {
-      if (!conn.alive || now - conn.lastSeen > CONFIG.idleTimeoutMs) {
+      if (!conn.alive || now - conn.lastSeen > cfg.idleTimeoutMs) {
         conn.ws.terminate();
         continue;
       }
@@ -510,7 +515,7 @@ async function main(): Promise<void> {
         conn.ws.terminate();
       }
     }
-  }, CONFIG.heartbeatMs);
+  }, cfg.heartbeatMs);
 
   /* ---- Expiry sweep ---------------------------------------------------- */
 
@@ -531,8 +536,7 @@ async function main(): Promise<void> {
 
   /* ---- Shutdown: zeroize everything before exiting -------------------- */
 
-  const shutdown = async (signal: string) => {
-    log.boot(`shutdown (${signal})`);
+  const close = async () => {
     clearInterval(heartbeat);
     clearInterval(sweep);
 
@@ -554,20 +558,54 @@ async function main(): Promise<void> {
     for (const c of claims.values()) c.pk.fill(0);
     claims.clear();
 
-    await Promise.allSettled([pub.quit(), sub.quit()]);
+    await bus.close();
     wss.close();
-    http.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 3000);
+    await new Promise<void>((resolve) => http.close(() => resolve()));
   };
 
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('unhandledRejection', (e) => log.fault(String(e)));
+  await new Promise<void>((resolve) => {
+    http.listen(port, () => {
+      const addr = http.address();
+      const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+      log.boot(`blind relay listening :${actualPort}`);
+      resolve();
+    });
+  });
 
-  http.listen(CONFIG.port, () => log.boot(`blind relay listening :${CONFIG.port}`));
+  const addr = http.address();
+  const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+
+  return {
+    port: actualPort,
+    url: `ws://127.0.0.1:${actualPort}`,
+    close,
+    http,
+    wss,
+    bus,
+  };
 }
 
-main().catch((e) => {
-  log.fault(String(e));
-  process.exit(1);
-});
+export { CONFIG };
+
+// Self-executing if run directly
+const isDirectRun =
+  process.argv[1] &&
+  (process.argv[1].endsWith('relay.ts') || process.argv[1].endsWith('relay.js'));
+
+if (isDirectRun) {
+  startRelayServer(CONFIG.port).then((server) => {
+    const shutdown = async (signal: string) => {
+      log.boot(`shutdown (${signal})`);
+      await server.close();
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    process.on('SIGINT', () => void shutdown('SIGINT'));
+    process.on('unhandledRejection', (e) => log.fault(String(e)));
+  }).catch((e) => {
+    log.fault(String(e));
+    process.exit(1);
+  });
+}
+

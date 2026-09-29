@@ -1,6 +1,19 @@
-import { Platform } from 'react-native';
-import * as SQLite from 'expo-sqlite';
 import type { SqlDriver, SqlConnection, SqlResult } from './db';
+
+let SQLite: any = null;
+let isNative = false;
+
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const RN = require('react-native');
+  if (RN?.Platform?.OS === 'android' || RN?.Platform?.OS === 'ios') {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    SQLite = require('expo-sqlite');
+    isNative = typeof SQLite?.openDatabaseSync === 'function';
+  }
+} catch {
+  isNative = false;
+}
 
 /**
  * expo-sqlite synchronous driver for native platforms (Android / iOS).
@@ -8,6 +21,9 @@ import type { SqlDriver, SqlConnection, SqlResult } from './db';
  */
 export const expoSqliteDriver: SqlDriver = {
   open(name: string): SqlConnection {
+    if (!isNative || !SQLite) {
+      return memoryDriver.open(name);
+    }
     const db = SQLite.openDatabaseSync(name);
 
     return {
@@ -17,7 +33,7 @@ export const expoSqliteDriver: SqlDriver = {
           /^(SELECT|WITH)\b/i.test(trimmed) || /^PRAGMA\s+[a-zA-Z0-9_]+$/i.test(trimmed);
 
         if (isSelect) {
-          const rows = db.getAllSync<T>(sql, params as any);
+          const rows = db.getAllSync(sql, params as any) as T[];
           return {
             rows: (rows ?? []) as T[],
             rowsAffected: 0,
@@ -176,6 +192,27 @@ export const memoryDriver: SqlDriver = {
           return { rows: [], rowsAffected: 1 };
         }
 
+        if (/SELECT\s+\*\s+FROM\s+contacts\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const c = mem.contacts.get(params[0]);
+          return { rows: c ? ([c] as any) : [], rowsAffected: 0 };
+        }
+
+        if (/SELECT\s+\*\s+FROM\s+contacts\s+WHERE\s+fingerprint\s*=\s*\?/i.test(trimmed)) {
+          const matched = [...mem.contacts.values()].filter((c) => c.fingerprint === params[0]);
+          return { rows: matched as any, rowsAffected: 0 };
+        }
+
+        if (/SELECT\s+\*\s+FROM\s+contacts/i.test(trimmed)) {
+          const all = [...mem.contacts.values()].sort((a, b) => b.created_at - a.created_at);
+          return { rows: all as any, rowsAffected: 0 };
+        }
+
+        if (/UPDATE\s+contacts\s+SET\s+verified_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const c = mem.contacts.get(params[1]);
+          if (c) c.verified_at = params[0];
+          return { rows: [], rowsAffected: c ? 1 : 0 };
+        }
+
         // 7. threads table
         if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+threads/i.test(trimmed)) {
           mem.threads.set(params[0], {
@@ -186,6 +223,16 @@ export const memoryDriver: SqlDriver = {
             unread_count: params[4],
           });
           return { rows: [], rowsAffected: 1 };
+        }
+
+        if (/SELECT\s+\*\s+FROM\s+threads\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const th = mem.threads.get(params[0]);
+          return { rows: th ? ([th] as any) : [], rowsAffected: 0 };
+        }
+
+        if (/SELECT\s+\*\s+FROM\s+threads/i.test(trimmed)) {
+          const all = [...mem.threads.values()].sort((a, b) => b.last_activity_at - a.last_activity_at);
+          return { rows: all as any, rowsAffected: 0 };
         }
 
         if (
@@ -362,7 +409,6 @@ export const memoryDriver: SqlDriver = {
 /**
  * Selects memoryDriver on web (Platform.OS === 'web') and expoSqliteDriver on native.
  */
-export const defaultDriver: SqlDriver =
-  Platform.OS === 'web' ? memoryDriver : expoSqliteDriver;
+export const defaultDriver: SqlDriver = isNative ? expoSqliteDriver : memoryDriver;
 
 export default defaultDriver;

@@ -8,7 +8,17 @@
     "client": "npm --prefix client start",
     "web": "npm --prefix client run web",
     "dev": "npm --prefix server run dev",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build:server": "npm --prefix server run build",
+    "typecheck": "npm --prefix server run build && npm --prefix client run typecheck",
+    "typecheck:client": "npm --prefix client run typecheck",
+    "typecheck:server": "npm --prefix server run build",
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:crypto": "tsx --test tests/crypto.test.ts",
+    "test:ratchet": "tsx --test tests/ratchet.test.ts",
+    "test:storage": "tsx --test tests/storage.test.ts",
+    "test:relay": "tsx --test tests/relay.test.ts",
+    "test:adversarial": "tsx --test tests/adversarial.test.ts",
+    "test:e2e": "tsx --test tests/e2e.test.ts"
   },
   "keywords": [],
   "author": "",

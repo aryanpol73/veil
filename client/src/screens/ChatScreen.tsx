@@ -72,8 +72,14 @@ import {
   insertMessage,
   listMessages,
   markReadAndArmTtl,
+  getDb,
+  getSession,
   type StoredMessage,
 } from '../storage/db';
+import { contactManager } from '../protocol/contacts/ContactManager';
+import { identityManager } from '../identity/IdentityManager';
+import { messageService } from '../messaging/MessageService';
+import type { ChatScreenRouteProp, RootNavigationProp } from '../types/navigation';
 
 type HapticType =
   | 'impactLight'
@@ -723,18 +729,22 @@ const Composer: React.FC<{
 /* ========================================================================== */
 
 export interface ChatScreenProps {
-  threadId: string;
-  peer: { alias: string; fingerprint: string; verified: boolean };
+  route?: ChatScreenRouteProp;
+  navigation?: RootNavigationProp;
+  threadId?: string;
+  peer?: { alias: string; fingerprint: string; verified: boolean };
   /** Persona label. Reads "Personal" in both partitions — no decoy tell. */
-  maskLabel: string;
-  deviceFingerprint: string;
-  sessionId: string;
-  onBack: () => void;
+  maskLabel?: string;
+  deviceFingerprint?: string;
+  sessionId?: string;
+  onBack?: () => void;
   /** Wire to the ratchet + relay. Resolve on relay ACK. */
   onTransmit?: (msg: StoredMessage, ttlMs?: number) => Promise<void>;
 }
 
 export const ChatScreen: React.FC<ChatScreenProps> = ({
+  route,
+  navigation,
   threadId,
   peer,
   maskLabel,
@@ -743,6 +753,31 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   onBack,
   onTransmit,
 }) => {
+  const effectiveThreadId = route?.params?.threadId ?? threadId ?? 'dt_0';
+  const effectiveContactId = route?.params?.contactId;
+
+  const contact = useMemo(() => {
+    if (effectiveContactId) return contactManager.getContact(effectiveContactId);
+    try {
+      const db = getDb();
+      const rows = db.execute<any>('SELECT contact_id FROM threads WHERE id = ?', [effectiveThreadId]).rows;
+      if (rows && rows.length > 0) return contactManager.getContact(rows[0].contact_id);
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }, [effectiveContactId, effectiveThreadId]);
+
+  const effectivePeer = peer ?? {
+    alias: contact?.alias ?? 'Peer',
+    fingerprint: contact?.fingerprint ?? '0000 0000 0000 0000 0000',
+    verified: contact?.verificationState === 'VERIFIED',
+  };
+
+  const effectiveSessionId = sessionId ?? getSession()?.sessionId ?? 'sess_veil_live';
+  const effectiveDeviceFp = deviceFingerprint ?? identityManager.getDeviceFingerprint();
+  const effectiveMaskLabel = maskLabel ?? 'Personal';
+
   const [messages, setMessages] = useState<StoredMessage[]>([]);
   const [mode, setMode] = useState<RetentionMode>('persistent');
   const [ttlMs, setTtlMs] = useState<number>(TTL_PRESETS[1]);
@@ -752,14 +787,23 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   /* ---- Load + periodic reconcile (TTL expiry, RAM sweeps) -------------- */
 
   const reload = useCallback(() => {
-    setMessages(listMessages(threadId));
-  }, [threadId]);
+    setMessages(listMessages(effectiveThreadId));
+  }, [effectiveThreadId]);
 
   useEffect(() => {
     reload();
     const t = setInterval(reload, 2000);
     return () => clearInterval(t);
   }, [reload]);
+
+  useEffect(() => {
+    const unsub = messageService.onMessage((msg) => {
+      if (msg.thread_id === effectiveThreadId) {
+        reload();
+      }
+    });
+    return unsub;
+  }, [effectiveThreadId, reload]);
 
   /* ---- Scroll velocity -> orb parallax --------------------------------- */
 
@@ -779,13 +823,37 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
     },
   });
 
+  const handleBack = useCallback(() => {
+    if (onBack) onBack();
+    else if (navigation?.canGoBack()) navigation.goBack();
+  }, [onBack, navigation]);
+
   /* ---- Actions --------------------------------------------------------- */
 
   const handleSend = useCallback(
-    (text: string) => {
+    async (text: string) => {
+      const activeMask = identityManager.getActiveMask();
+      if (contact && activeMask) {
+        try {
+          const msg = await messageService.sendMessage({
+            threadId: effectiveThreadId,
+            contact,
+            body: text,
+            retention: mode,
+            ttlMs: mode === 'timed' ? ttlMs : undefined,
+            senderFp: activeMask.fingerprint,
+          });
+          setMessages((prev) => [...prev, msg]);
+          requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
+          return;
+        } catch {
+          /* fallback */
+        }
+      }
+
       const msg = insertMessage({
         id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-        threadId,
+        threadId: effectiveThreadId,
         direction: 'out',
         retention: mode,
         body: text,
@@ -793,12 +861,9 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
       });
       setMessages((prev) => [...prev, msg]);
       requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
-      // Ratchet-encrypt and hand to the blind relay. Failures are surfaced by
-      // the delivery indicator, never by a modal — a modal during duress is a
-      // behavioural tell and an interruption.
       onTransmit?.(msg, mode === 'timed' ? ttlMs : undefined).catch(() => {});
     },
-    [mode, threadId, ttlMs, onTransmit],
+    [contact, effectiveThreadId, mode, ttlMs, onTransmit],
   );
 
   const handleBurn = useCallback((id: string) => {
@@ -876,18 +941,18 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
       </KeyboardAvoidingView>
 
       <FrostedHeader
-        alias={peer.alias}
-        fingerprint={peer.fingerprint}
-        verified={peer.verified}
-        maskLabel={maskLabel}
-        onBack={onBack}
+        alias={effectivePeer.alias}
+        fingerprint={effectivePeer.fingerprint}
+        verified={effectivePeer.verified}
+        maskLabel={effectiveMaskLabel}
+        onBack={handleBack}
       />
 
       {/* Last child, non-interactive, spans the whole viewport. */}
       <DynamicWatermark
-        deviceFingerprint={deviceFingerprint}
-        sessionId={sessionId}
-        recipientFingerprint={peer.fingerprint}
+        deviceFingerprint={effectiveDeviceFp}
+        sessionId={effectiveSessionId}
+        recipientFingerprint={effectivePeer.fingerprint}
         onCaptureDetected={handleCaptureDetected}
       />
     </View>

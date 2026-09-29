@@ -1,8 +1,9 @@
 /**
  * ============================================================================
- *  VEIL — DOUBLE RATCHET (CRYPTO EXPORT SEAM)
+ *  VEIL — MESSAGING SERVICE EXPORT
  * ============================================================================
  */
 
-export * from '../protocol/ratchet';
-export { default } from '../protocol/ratchet';
+export * from './RatchetManager';
+export * from './MessageService';
+export { default } from './MessageService';

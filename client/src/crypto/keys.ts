@@ -21,7 +21,11 @@
  * ============================================================================
  */
 
-// @noble v2 exports map requires explicit '.js' subpaths (e.g. './ed25519.js', './blake2.js', './argon2.js', './chacha.js')
+export { ed25519, x25519 } from '@noble/curves/ed25519.js';
+export { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
+export { blake2b } from '@noble/hashes/blake2.js';
+export { argon2id } from '@noble/hashes/argon2.js';
+
 import { ed25519, x25519 } from '@noble/curves/ed25519.js';
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { blake2b } from '@noble/hashes/blake2.js';
