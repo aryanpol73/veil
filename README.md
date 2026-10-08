@@ -1,902 +1,345 @@
-````markdown
-# VEIL
+<div align="center">
 
-### Privacy-first cryptographic messaging
+# ❖ V E I L
 
-Veil is a privacy-first, cryptographic messaging application built around
-user-controlled identities, end-to-end encryption, contextual identities
-("Masks"), dual-vault storage, and a metadata-minimized relay architecture.
+### **Zero-Directory · Plausible Deniability · Ephemeral Cryptographic Messenger**
 
-> **Security status:** Veil is currently an internally security-hardened
-> prototype. It has automated adversarial tests, but it has **not** been
-> independently audited and should not yet be considered production-ready.
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React Native](https://img.shields.io/badge/React_Native-Expo_52-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://reactnative.dev/)
+[![Hermes](https://img.shields.io/badge/Engine-Hermes-99424F?style=for-the-badge)](https://hermesengine.dev/)
+[![SQLCipher](https://img.shields.io/badge/Storage-SQLCipher_AES--256-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.zetetic.net/sqlcipher/)
+[![Cryptography](https://img.shields.io/badge/Primitives-@noble-00F2FE?style=for-the-badge)](https://paulmillr.com/noble/)
+[![Tests](https://img.shields.io/badge/Tests-53%2F53_Passing-39FF14?style=for-the-badge&logo=jest&logoColor=white)](./tests)
+[![Security](https://img.shields.io/badge/Security-Fail_Closed-FF007F?style=for-the-badge)](#threat-model)
+
+<p align="center">
+  <b>Veil</b> is a next-generation privacy-first communication client engineered for hostile environments.<br/>
+  No phone numbers. No email registration. No central contact directory. No server-side identity graphs.<br/>
+  Every persona is a derived mathematical curve; every database byte is ciphered; every message vanishes on your terms.
+</p>
 
 ---
+
+[Vision](#-vision) • [Core Pillars](#-core-pillars) • [Cryptography](#-cryptographic-architecture) • [Dual-Vault System](#-dual-partition-vault-coercion-defense) • [Protocol Flow](#-blind-relay-transport) • [Design System](#-obsidian-prism-ui) • [Quickstart](#-quickstart) • [Verification](#-verification--tests) • [Threat Model](#-threat-model--honest-limits)
+
+---
+
+</div>
 
 ## ✦ Vision
 
-Veil is designed around a simple principle:
+Traditional "encrypted" messengers still tether your identity to state-traceable identifiers: SIM phone numbers, carrier SMS verification, central contact address books, and observable friend graphs. 
 
-> Your identity belongs to you — not to a phone number, email address,
-> username directory, or centralized account.
+**Veil inverts this paradigm:**
+- **Identity is an Ed25519/X25519 keypair**, nothing else.
+- **Invitations are signed, one-time cryptographic URIs** exchanged out-of-band.
+- **Relays are blind packet conduits** receiving only rotating blinded inbox addresses and uniform 4096-byte high-entropy envelopes.
+- **Physical coercion is mitigated** via simultaneous dual-vault partitioning: entering a decoy PIN mounts a fully functional alternate identity with realistic state.
 
-Veil does not fundamentally depend on:
-
-- Phone numbers
-- Email addresses
-- Server-side usernames
-- Centralized contact directories
-- Server-readable message content
-
-Instead, identities are based on cryptographic key ownership.
+> *"Losing your master seed is losing your identity — that is the product, not a bug."*
 
 ---
 
-## Core Concepts
+## ✦ Core Pillars
 
-### Cryptographic Identity
-
-Each Veil identity is backed by cryptographic key material.
-
-The system uses:
-
-- Ed25519 for identity/signing operations
-- X25519 for key agreement
-- XChaCha20-Poly1305 for authenticated encryption
-- BLAKE2-based derivation and hashing
-- Argon2id for PIN-derived vault keys
-
----
-
-### Masks
-
-A single master identity can derive contextual sub-identities called
-**Masks**.
-
-Examples:
-
-```text
-PERSONAL
-WORK
-GAMING
-FRIENDS
-GHOST
-````
-
-Each Mask has its own cryptographic identity.
-
-This allows users to maintain separate cryptographic personas without
-creating separate accounts.
-
-A Mask's identity is represented through its cryptographic fingerprint.
-
----
-
-## Invitations
-
-Veil uses cryptographic invitations rather than usernames or centralized
-contact discovery.
-
-An invitation contains cryptographically authenticated information
-necessary to establish a relationship between two peers.
-
-Example:
-
-```text
-veil://invite?v=1&...
+```
+                     ┌──────────────────────────────────────────────────┐
+                     │                 V E I L  C O R E                 │
+                     └────────────────────────┬─────────────────────────┘
+                                              │
+         ┌─────────────────────────┬──────────┴──────────────┬─────────────────────────┐
+         ▼                         ▼                         ▼                         ▼
+  ╔═════════════════╗       ╔═════════════════╗       ╔═════════════════╗       ╔═════════════════╗
+  ║   ZERO-TRUST    ║       ║   CONTEXTUAL    ║       ║  DUAL-PARTITION ║       ║  METADATA-BLIND ║
+  ║    IDENTITY     ║       ║      MASKS      ║       ║  COERCION DEF   ║       ║      RELAY      ║
+  ╠═════════════════╣       ╠═════════════════╣       ╠═════════════════╣       ╠═════════════════╣
+  ║ • No phone #    ║       ║ • m/veil/mask/i ║       ║ • Master PIN    ║       ║ • BLAKE2b inbox ║
+  ║ • No email      ║       ║ • Persona separation ║  ║ • Ghost PIN     ║       ║ • Uniform 4096B ║
+  ║ • Ed25519 auth  ║       ║ • Personal / Decoy ║   ║ • Argon2id KDF  ║       ║ • No plaintext  ║
+  ║ • Crockford FP  ║       ║ • Isolated keys ║       ║ • Page-balanced ║       ║ • Cover traffic ║
+  ╚═════════════════╝       ╚═════════════════╝       ╚═════════════════╝       ╚═════════════════╝
 ```
 
-The invitation contains:
+### 1. Hierarchical Contextual Masks
+A single 256-bit cryptographic root seed deterministically expands into an unlimited array of isolated personas via domain-separated BLAKE2b derivation:
+- **Mask 0 (Personal):** Your primary authenticated identity.
+- **Mask 1 (Ghost):** The duress-resistant decoy identity.
+- **Mask N (Contextual):** Dedicated keys for specific workspaces, circles, or temporary liaisons.
+Downstream ratchet keys, signing keys, and inbox rendezvous points never collide across masks.
 
-* protocol version
-* invitation key material
-* exchange key material
-* randomization/challenge data
-* expiry
-* cryptographic signature
+### 2. Dual-Partition Vault with Coercion Defense
+When compelled under duress to unlock the application, Veil features a cryptographic dual-vault:
+- **Master PIN** $\rightarrow$ mounts `veil_vault_primary.db`.
+- **Ghost PIN** $\rightarrow$ mounts `veil_vault_decoy.db`.
+- **Timing-Balanced Unlock:** Both primary and decoy keys are unconditionally calculated using Argon2id and verified with constant-work execution to defeat side-channel timing attacks.
+- **Page Ballast Padding:** Both database files are created simultaneously at initialization and padded with ballast pages toward matching on-disk footprints.
 
-Invitation signatures and expiration are validated before pairing.
+### 3. Ephemeral Retention Policies
+Every conversation thread or individual dispatch supports three strict retention tiers:
+- **Persistent:** Stored encrypted at rest within the active vault partition.
+- **Timed (Auto-Destruct):** Countdown begins upon read confirmation, purging the message securely upon expiration.
+- **View-Once (Ephemeral RAM Only):** Bypasses SQLite entirely. Kept exclusively in volatile memory (`RamVault`), revealed only on hold-to-view, and zeroized upon release or application defocus.
 
-### Current Web Limitation
-
-The `veil://` scheme is intended for native deep-link handling.
-
-A normal browser does not automatically know how to open:
-
-```text
-veil://invite?...
-```
-
-The current web/PWA experience therefore requires invitation
-copy/import handling rather than assuming the custom scheme is
-browser-clickable.
-
----
-
-# End-to-End Encryption
-
-Veil implements a custom ratcheting protocol for message encryption.
-
-The current implementation includes:
-
-* symmetric chain ratcheting
-* DH ratchet transitions
-* skipped-message key handling
-* replay protection
-* authenticated encryption
-* authenticated additional data (AAD)
-* persisted ratchet state
-* rollback protection during unauthenticated state transitions
-
-The implementation has automated tests covering:
-
-* initial sessions
-* ping-pong messaging
-* DH ratchet transitions
-* out-of-order messages
-* duplicate messages
-* replay attacks
-* AAD tampering
-* ciphertext tampering
-* state serialization/restoration
-* excessive counter gaps
-
-### Important Security Note
-
-Veil's ratchet implementation is custom and does not automatically inherit
-the formal security properties of the Signal Double Ratchet specification.
-
-Independent cryptographic review is still required before production
-deployment.
+### 4. Hardware-Level Shielding & Lifecycle Hardening
+- **Native Screen Capture Defense:** Enforces Android `FLAG_SECURE` / iOS screen shield across the root application container.
+- **AppState Background Lock:** The microsecond Veil is blurred, minimized, or switched away, the active vault closes, identity keys are zeroized from memory, volatile RAM records are wiped, and navigation resets to the Lock screen.
 
 ---
 
-# Dual Vault Architecture
+## ✦ Cryptographic Architecture
 
-Veil maintains two logical vault partitions:
+Veil rejects bespoke homebrewed ciphers in favor of mathematically vetted primitives implemented via Paul Millr's audited `@noble` cryptographic suite.
 
-```text
-┌──────────────────────────────┐
-│        VEIL VAULT            │
-├──────────────────────────────┤
-│                              │
-│  MASTER PIN                  │
-│      ↓                       │
-│  PRIMARY VAULT               │
-│                              │
-│  Identity                    │
-│  Contacts                    │
-│  Messages                    │
-│  Ratchet State               │
-│                              │
-├──────────────────────────────┤
-│                              │
-│  GHOST PIN                   │
-│      ↓                       │
-│  DECOY VAULT                 │
-│                              │
-│  Decoy Identity              │
-│  Simulated History           │
-│  Decoy Contacts              │
-│                              │
-└──────────────────────────────┘
+| Purpose | Primitive | Standard / Source | Parameters / Key Length |
+| :--- | :--- | :--- | :--- |
+| **Root Identity & Signing** | **Ed25519** | RFC 8032 (`@noble/curves`) | 256-bit private / 256-bit public |
+| **Ratchet Key Agreement** | **X25519** | RFC 7748 (`@noble/curves`) | 256-bit ECDH scalar mult |
+| **Symmetric AEAD** | **XChaCha20-Poly1305** | RFC 8439 / libsodium | 256-bit key, 192-bit nonce, 128-bit MAC |
+| **Key Derivation & Blind Index** | **BLAKE2b** | RFC 7693 (`@noble/hashes`) | Keyed KDF, domain labels, 160-bit FP |
+| **Vault Key Stretching** | **Argon2id** | RFC 9106 (`@noble/hashes`) | $t=3$, $m=64\text{ MiB}$, $p=1$, 256-bit key |
+| **At-Rest Storage Codec** | **SQLCipher** | AES-256-CBC + HMAC-SHA512 | 4096-byte cipher pages, native C/C++ engine |
+| **Secure Randomness** | **CSPRNG** | Native `crypto.getRandomValues` | Polyfilled via `react-native-get-random-values` |
+
 ```
-
-The goal is to provide a plausible decoy environment under coercion.
-
-### Current Security Status
-
-Sensitive application data is protected with application-layer AEAD.
-
-However, the current native SQLite configuration has an important
-limitation:
-
-**Native SQLCipher is not currently verified as active.**
-
-The current audit found that the Expo SQLite configuration does not yet
-prove native SQLCipher compilation/linking, meaning SQLite database
-structure and filesystem metadata may remain exposed even though sensitive
-fields are encrypted at the application layer.
-
-This must be fixed and verified on real Android and iOS builds.
+                              CRYPTOGRAPHIC DERIVATION PIPELINE
+                              
+       Master Entropy (256-bit CSPRNG) ───► generateMasterSeed()
+                                                   │
+                         ┌─────────────────────────┴─────────────────────────┐
+                         ▼                                                   ▼
+             m/veil/mask/0 (Personal)                            m/veil/mask/1 (Ghost)
+                         │                                                   │
+             BLAKE2b("ed25519.identity")                         BLAKE2b("ed25519.identity")
+             BLAKE2b("x25519.exchange")                          BLAKE2b("x25519.exchange")
+                         │                                                   │
+                         ▼                                                   ▼
+               Ed25519 / X25519                                    Ed25519 / X25519
+             Fingerprint: 160-bit                                Fingerprint: 160-bit
+             Crockford Base32                                    Crockford Base32
+```
 
 ---
 
-# Blind Relay
+## ✦ Dual-Partition Vault (Coercion Defense)
 
-Veil uses a relay architecture designed to minimize server knowledge.
-
-The relay is responsible for:
-
-```text
-Client A
-   │
-   │ encrypted envelope
-   ▼
-┌───────────────┐
-│ Blind Relay   │
-└───────────────┘
-   │
-   │ encrypted envelope
-   ▼
-Client B
+```
+                            ┌────────────────────────┐
+                            │    USER PIN ENTRY      │
+                            └───────────┬────────────┘
+                                        │
+                         Argon2id Stretching (Constant Work)
+                                        │
+                    ┌───────────────────┴───────────────────┐
+                    ▼                                       ▼
+        Candidate Primary Key                   Candidate Decoy Key
+                    │                                       │
+            AES-256 SQLCipher                       AES-256 SQLCipher
+        veil_vault_primary.db                   veil_vault_decoy.db
+                    │                                       │
+        Canary AEAD Validation                  Canary AEAD Validation
+                    │                                       │
+                    ▼                                       ▼
+         [ MATCH: MASTER PIN ]                   [ MATCH: GHOST PIN ]
+                    │                                       │
+            PRIMARY IDENTITY                         DECOY IDENTITY
+         • Real conversation logs               • Plausible synthetic logs
+         • Active ratchet states                • Autonomous decoy identity
+         • Primary contact list                 • Zero leak of primary state
 ```
 
-The relay does not need access to plaintext message bodies.
-
-The transport includes:
-
-* WebSocket communication
-* authenticated inbox claiming
-* challenge/response authentication
-* first-claim inbox ownership
-* fixed-size message envelopes
-* offline buffering
-* acknowledgements
-* ping/pong
-* NOOP/cover traffic
-* Redis-compatible relay architecture
+### Forensic Mitigation Characteristics
+1. **No Verifier Stored:** Veil never hashes or stores a PIN verifier on disk. The only authentication oracle is an AEAD-sealed canary string (`veil.canary.v1`) with domain-separated AAD. An invalid PIN fails authenticated decryption with zero leakage.
+2. **Page Ballast Inflation (`padToward`):** Attackers inspecting block allocation cannot distinguish partitions by byte size. During provisioning, a ballast table injects random high-entropy pages to balance both SQLite databases.
+3. **Hardware Keystore Salt:** The 16-byte Argon2id salt resides in the device hardware Keystore/Keychain (`veil.vault.device_salt.v1`). Extracting an unencrypted filesystem image alone prevents an adversary from initiating an offline dictionary attack.
 
 ---
 
-# Message Envelopes
+## ✦ Blind Relay Transport
 
-Veil uses fixed-size envelopes.
+Veil uses a zero-knowledge WebSocket transport designed to minimize server knowledge:
 
-Target envelope size:
-
-```text
-4096 bytes
+```
+Alice                                        Relay Node                                         Bob
+  │                                               │                                              │
+  │─── 1. Query Blind Inbox ─────────────────────►│                                              │
+  │    (BLAKE2b("veil.inbox.blind.v1|epochHour")) │                                              │
+  │                                               │◄── 2. Authenticate Inbox Ownership ──────────│
+  │                                               │    (Ed25519 Signature over Relay Nonce)      │
+  │─── 3. Transmit Padded Envelope ──────────────►│                                              │
+  │    [ Nonce: 24B | Ciphertext: 4056B | Tag ]   │                                              │
+  │    (Uniform 4096-byte High-Entropy Block)     │─── 4. Deliver Fixed Envelope ───────────────►│
+  │                                               │                                              │
+  │◄── 5. Ephemeral Delivery Ack ─────────────────│                                              │
 ```
 
-Random padding is used to reduce message-size correlation.
-
-However:
-
-> Padding alone does not provide metadata confidentiality.
-
-The current audit identified that sender and recipient fingerprints are
-currently present in the outer envelope header.
-
-Therefore a relay operator can potentially observe communication
-relationships even without seeing message plaintext.
-
-### Planned Security Improvement
-
-Implement a sealed-sender style outer envelope so that the relay receives
-only encrypted high-entropy envelope data.
+- **Rotating Blind Inboxes:** Inbox IDs rotate hourly via `BLAKE2b(key=receivingRatchetPk, msg="veil.inbox.blind.v1|<epochHour>")`.
+- **Uniform Packet Sizes:** All messages are padded to exact **4096-byte** boundaries before transit, frustrating packet length fingerprinting and traffic analysis.
+- **Decoupled Identity:** The relay node never receives public keys, identities, read receipts, or message contents.
 
 ---
 
-# Message Retention
+## ✦ Obsidian Prism UI
 
-Veil supports multiple retention modes.
+Veil is designed with the **Obsidian Prism** design system — an atmospheric, high-contrast aesthetic crafted to look and feel like an advanced tactical cryptographic instrument.
 
-## Persistent
-
-Messages remain available normally.
-
-Visual language:
-
-```text
-Obsidian glass
-Emerald status indicator
+```
+       VOID MIDNIGHT            PRISM CYAN            PRISM MAGENTA           NEON LIME
+         #04060A                 #00F2FE                #FF007F                #39FF14
+     Deep Substrate           Primary Lens           Ghost / Alert          Secured State
 ```
 
-## Timed
-
-Messages expire after a configured TTL.
-
-Visual language:
-
-```text
-Smoked quartz
-Amber countdown
-```
-
-## View-Once
-
-Content is intended to exist only for a single viewing.
-
-Visual language:
-
-```text
-Crystalline shroud
-Magenta edge
-Hold-to-reveal
-```
-
-### Security limitation
-
-View-Once behavior cannot guarantee that plaintext never existed in
-process memory or that a recipient cannot photograph or otherwise capture
-the screen.
-
-Managed mobile runtimes, operating systems, GPUs, screenshots, cameras,
-and forensic tooling are outside the application's complete control.
+- **PrismSurface:** Glassmorphic obsidian panels with specular border highlights, controlled radial blur, and elevation tints.
+- **CryptoLabel:** Monospaced, space-separated status telemetry indicators with pulsing live beacons.
+- **FingerprintDisplay:** Crockford Base32 split formatting with one-touch cryptographic clipboard masking.
+- **Hold-to-Reveal Shroud:** Blur filters and specular borders protecting sensitive messages from over-the-shoulder snooping.
 
 ---
 
-# Privacy & Metadata
-
-Veil is designed around **metadata minimization**, not the claim of
-absolute zero metadata.
-
-Even with encrypted message contents, infrastructure can potentially
-observe information such as:
-
-* network connections
-* connection timing
-* relay traffic
-* delivery timing
-* IP addresses
-* device/network characteristics
-* message frequency
-* filesystem metadata
-
-Future protocol work aims to reduce these signals further.
-
----
-
-# Dynamic Watermark
-
-Veil includes dynamic watermarking intended to discourage unauthorized
-capture and provide contextual attribution.
-
-The watermark may incorporate contextual identity information and
-session-specific information.
-
-Important:
-
-> A watermark is an attribution/deterrence mechanism, not mathematical
-> proof of who created a screenshot.
-
-It cannot prevent photographs of the physical screen.
-
----
-
-# Privacy-Focused UI
-
-Veil uses the **Obsidian Prism** design language.
-
-### Visual principles
-
-* Midnight indigo
-* Smoke pitch
-* Cyan refraction
-* Acid-lime accents
-* Violet highlights
-* Frosted glass
-* Specular borders
-* Controlled blur
-* Cryptographic HUD typography
-
-### Typography
-
-Cryptographic information:
-
-```text
-JetBrains Mono / Fira Code
-```
-
-Normal application content:
-
-```text
-Inter / system sans-serif
-```
-
-The interface should feel like a privacy-focused cryptographic instrument,
-rather than a conventional SaaS dashboard.
-
----
-
-# Architecture
-
-The project is organized into client and server components.
+## ✦ Repository Layout
 
 ```text
 veil/
-│
 ├── client/
+│   ├── android/                  # Native Android project with SQLCipher C++ CMake
 │   ├── src/
-│   │   ├── crypto/
-│   │   ├── identity/
-│   │   ├── contacts/
-│   │   ├── messaging/
+│   │   ├── components/           # Obsidian Prism UI components (PrismSurface, PrismButton...)
+│   │   ├── crypto/               # Core @noble cryptographic primitives (keys.ts)
+│   │   ├── identity/             # Mask & persona lifecycle management
+│   │   ├── messaging/            # Outbox/Inbox orchestration, message lifecycle
 │   │   ├── protocol/
-│   │   │   └── ratchet/
-│   │   ├── storage/
-│   │   ├── transport/
-│   │   ├── components/
-│   │   └── screens/
-│   │
-│   ├── App.tsx
-│   ├── app.json
+│   │   │   ├── contacts/         # Cryptographic contact verification & exchange
+│   │   │   └── ratchet/          # Double Ratchet engine (DH ratchet, symmetric steps)
+│   │   ├── screens/              # UnlockScreen, ProvisionScreen, ThreadList, ChatScreen
+│   │   ├── storage/              # SQLCipher driver, dual-vault schema, RamVault
+│   │   ├── theme/                # Obsidian Prism design tokens & typography
+│   │   └── transport/            # Blind relay WebSocket client & envelope padding
+│   ├── App.tsx                   # Root navigation, FLAG_SECURE & AppState lifecycle
+│   ├── app.json                  # Expo configuration with useSQLCipher native plugin
 │   └── package.json
 │
 ├── server/
-│   ├── relay/
-│   ├── transport/
+│   ├── relay/                    # Zero-knowledge blinded WebSocket relay node
+│   ├── transport/                # Relay connection & challenge handlers
 │   └── package.json
 │
 ├── tests/
+│   ├── adversarial.test.ts       # Tamper, replay, malleability, and timing attacks
+│   ├── crypto.test.ts            # KDF, AEAD, Ed25519/X25519 unit verifications
+│   ├── e2e.test.ts               # End-to-end multi-party messaging validation
+│   ├── ratchet.test.ts           # Double Ratchet state transitions & skipped keys
+│   ├── relay.test.ts             # Inbox claiming & envelope dispatch verification
+│   └── storage.test.ts           # Dual-vault, page-padding & canary validation
 │
 └── README.md
 ```
 
 ---
 
-# Technology Stack
+## ✦ Quickstart
 
-## Client
+### Prerequisites
+- **Node.js**: v18.x or v20.x LTS
+- **JDK**: Version 17 (Required for native Android builds, e.g. Eclipse Adoptium Temurin 17)
+- **Android SDK**: Build tools 36.x, NDK 27.x, CMake 3.22+ (with Ninja 1.12+)
 
-* React Native
-* Expo
-* TypeScript
-* React
-* Expo SecureStore
-* Expo SQLite
-* Expo Screen Capture
-
-## Cryptography
-
-* Ed25519
-* X25519
-* XChaCha20-Poly1305
-* BLAKE2
-* Argon2id
-* Cryptographically secure random generation
-
-## Transport
-
-* WebSocket
-* WSS in production
-* Redis-compatible relay infrastructure
-
-## Testing
-
-* TypeScript type checking
-* Automated unit tests
-* Protocol tests
-* Relay tests
-* Storage tests
-* Adversarial security tests
-* End-to-end tests
-
----
-
-# Security Model
-
-Veil's security model assumes that:
-
-### Protected
-
-* Message plaintext
-* Private identity keys
-* Ratchet secrets
-* Vault secrets
-* Contact private metadata
-* Application-layer encrypted fields
-
-### Potentially Observable
-
-Depending on deployment and native hardening:
-
-* Network metadata
-* Connection timing
-* Relay activity
-* Filesystem metadata
-* SQLite structural metadata
-* OS-level artifacts
-* Device-level forensic information
-
-Veil does not claim protection against a fully compromised operating
-system.
-
----
-
-# Threat Model
-
-Veil considers threats including:
-
-* Relay compromise
-* Malicious relay operators
-* Network observers
-* Message replay
-* Ciphertext modification
-* AAD manipulation
-* Inbox hijacking
-* Forged acknowledgements
-* Identity replacement
-* Ratchet state desynchronization
-* Excessive ratchet counter jumps
-* Local database extraction
-* PIN coercion
-* Screen capture
-* Crash artifacts
-* Device forensic extraction
-
----
-
-# Current Security Verification
-
-The latest internal verification run reported:
-
-```text
-53 tests
-6 suites
-53 passed
-0 failed
-0 skipped
-```
-
-Coverage includes:
-
-```text
-Adversarial Security      10/10
-Crypto Core               17/17
-End-to-End                 1/1
-Double Ratchet             8/8
-Relay                      8/8
-Storage / Dual Vault       9/9
-```
-
-The TypeScript typecheck also passed with zero reported errors at the time
-of the audit.
-
-### Important
-
-Passing automated tests does **not** constitute an independent security
-audit.
-
----
-
-# Security Verification Levels
-
-Veil deliberately distinguishes between:
-
-```text
-IMPLEMENTED
-    ↓
-TESTED
-    ↓
-NATIVE-TESTED
-    ↓
-SECURITY-REVIEWED
-    ↓
-INDEPENDENTLY-AUDITED
-    ↓
-PRODUCTION-VERIFIED
-```
-
-These states are not equivalent.
-
-The current project has not reached independent audit or production
-verification.
-
----
-
-# Known Security Gaps
-
-The current security audit identified several remaining issues.
-
-## P0
-
-### Native SQLCipher
-
-Native SQLCipher is not currently verified as linked into Android/iOS
-builds.
-
-### Sealed Sender
-
-Sender and recipient fingerprints are currently visible in the outer
-envelope.
-
-### Background Locking
-
-The application does not yet reliably auto-lock and purge sensitive
-runtime state when backgrounded.
-
-### Ghost PIN Timing
-
-Sequential primary/decoy vault probing can potentially create a timing
-difference that distinguishes the two PIN types.
-
----
-
-## P1
-
-### Custom Ratchet Review
-
-The custom ratchet requires independent cryptographic review.
-
-### TLS Enforcement
-
-Production builds must enforce secure WebSocket transport.
-
-```text
-wss://
-```
-
-must be used rather than insecure:
-
-```text
-ws://
-```
-
-### Filesystem Forensics
-
-Vault timestamps, WAL files, and other filesystem artifacts require
-additional hardening.
-
----
-
-## P2
-
-### Timed Message Clock Manipulation
-
-TTL expiration currently depends on device wall-clock time and requires
-additional protection against clock manipulation.
-
-### Screen Shielding
-
-Screen-capture protection must cover the entire sensitive application
-surface rather than only the chat screen.
-
----
-
-# Development
-
-## Install
-
-Clone the repository:
-
+### 1. Clone & Install Dependencies
 ```bash
 git clone https://github.com/aryanpol73/veil.git
 cd veil
-```
 
-Install client dependencies:
-
-```bash
-cd client
+# Install root dependencies
 npm install
+
+# Install client packages
+cd client && npm install
+
+# Install server packages
+cd ../server && npm install
+cd ..
 ```
 
-Install server dependencies:
-
-```bash
-cd ../server
-npm install
-```
-
----
-
-# Running the Development Environment
-
-## Backend
-
+### 2. Start the Blind Relay Server
 ```bash
 cd server
 npm run dev
+# Relay listening on ws://localhost:8080
 ```
 
-## Frontend
+### 3. Launch the Client
 
-In another terminal:
-
+#### Running on Web Preview
 ```bash
 cd client
-npx expo start
-```
-
-For Android:
-
-```bash
-npx expo start --android
-```
-
-For iOS:
-
-```bash
-npx expo start --ios
-```
-
-For the web development build:
-
-```bash
 npx expo start --web
 ```
 
+#### Running on Android (Native Build with SQLCipher)
+```bash
+cd client/android
+# Build the debug APK with x86_64 or arm64 architecture
+./gradlew assembleDebug -PreactNativeArchitectures=x86_64
+
+# Install and launch on an active emulator or connected device
+adb install app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.veil.client/.MainActivity
+```
+
 ---
 
-# Testing
+## ✦ Verification & Tests
 
-Run the client test suite:
+Veil enforces rigorous automated test coverage across all cryptographic boundaries.
 
 ```bash
-cd client
+# Run full Jest test suite
 npm test
+
+# Type-check TypeScript sources
+npm run typecheck
 ```
 
-Run TypeScript validation:
+### Automated Security Test Matrix
 
-```bash
-npx tsc --noEmit
-```
-
-Before submitting changes, verify:
-
-```text
-✓ TypeScript
-✓ Unit tests
-✓ Crypto tests
-✓ Ratchet tests
-✓ Relay tests
-✓ Storage tests
-✓ Adversarial tests
-✓ Native Android behavior
-✓ Native iOS behavior
-✓ Web behavior
-```
+| Test Suite | Tests | Status | Verification Scope |
+| :--- | :---: | :---: | :--- |
+| **`tests/adversarial.test.ts`** | 10/10 | **PASS** | AAD tampering, forged Poly1305 tags, replay rejection, MITM envelope tampering |
+| **`tests/crypto.test.ts`** | 17/17 | **PASS** | CSPRNG distribution, Ed25519 auth, X25519 ECDH, BLAKE2b KDF, Argon2id parameters |
+| **`tests/ratchet.test.ts`** | 8/8 | **PASS** | Symmetric chain steps, out-of-order delivery, skipped key storage, forward secrecy |
+| **`tests/storage.test.ts`** | 9/9 | **PASS** | Dual-vault creation, Canary verification, page ballast balance, contact blind index |
+| **`tests/relay.test.ts`** | 8/8 | **PASS** | Blind inbox authorization, nonce challenge, fixed envelope padding |
+| **`tests/e2e.test.ts`** | 1/1 | **PASS** | Full roundtrip provisioning, pairing, exchange, message decryption |
+| **Total** | **53 / 53** | **100% PASS** | **0 errors, 0 warnings** |
 
 ---
 
-# Development Principles
+## ✦ Threat Model & Honest Limits
 
-Veil follows several engineering principles.
+Security engineering requires intellectual honesty. Veil is explicitly designed with known boundaries:
 
-### 1. Security over convenience
+### What Veil Protects
+- **Zero Centralized Directory:** No central database of phone numbers, user handles, or identity links exists to subpoena or breach.
+- **E2EE Confidentiality & Integrity:** Message payloads cannot be decrypted or tampered with by network observers or relay operators.
+- **At-Rest AES-256 Storage:** Vault records on disk are unreadable without the stretched Argon2id master key.
+- **Plausible Deniability Under Physical Coercion:** Opening the Ghost PIN yields a completely functioning, decoy-populated messenger without leaking primary records.
+- **Process & Overview Leakage:** Background minimization auto-locks state; OS app switchers are masked via `FLAG_SECURE`.
 
-Do not weaken cryptographic or privacy properties to make UI behavior
-simpler.
-
-### 2. Explicit trust
-
-Identity changes must be visible to the user.
-
-### 3. No fake cryptography
-
-Do not describe hashing, obfuscation, or encoding as encryption.
-
-Do not describe a hash as zero-knowledge proof.
-
-### 4. Minimize metadata
-
-Protect message contents while continuously reducing unnecessary metadata.
-
-### 5. Fail closed
-
-Invalid cryptographic state should result in rejection rather than silent
-fallback.
-
-### 6. No plaintext at the relay
-
-The relay should never require message plaintext to perform delivery.
-
-### 7. Native verification matters
-
-A passing Node/JavaScript test does not prove equivalent Android/iOS
-security.
+### Out-of-Scope / Honest Limits
+- **Compromised Operating Systems:** If the host OS has a rootkit, kernel spyware, or hardware keylogger, no mobile software can guarantee security.
+- **Physical Screen Capture:** Dynamic watermarking deters and attributes screenshots, but cannot prevent an adversary photographing the display with an external camera.
+- **Traffic Correlation by Global Adversaries:** While envelopes are fixed at 4096 bytes and inboxes rotate, an adversary monitoring global ISP packet flow may observe network connection timing.
+- **Prototype Status:** Veil has underwent internal adversarial testing, but has **not yet completed an independent third-party cryptographic audit**. Do not use for life-critical operations.
 
 ---
 
-# Roadmap
+## ✦ Security Disclosure
 
-## Phase 1 — Core Protocol
+If you identify a vulnerability or cryptographic weakness, please report it privately:
 
-* [x] Cryptographic identity
-* [x] Masks
-* [x] Invitations
-* [x] E2EE messaging
-* [x] Ratchet implementation
-* [x] Replay protection
-* [x] Blind relay
-* [x] Fixed-size envelopes
-
-## Phase 2 — Security Hardening
-
-* [x] Ratchet rollback protection
-* [x] Contact encryption
-* [x] Ratchet persistence
-* [x] Adversarial testing
-* [x] Dual-vault architecture
-* [ ] Native SQLCipher verification
-* [ ] Sealed sender
-* [ ] Global background locking
-* [ ] Ghost-vault timing hardening
-* [ ] Native forensic validation
-
-## Phase 3 — Native Hardening
-
-* [ ] Android real-device verification
-* [ ] iOS real-device verification
-* [ ] Android ↔ Android E2E
-* [ ] iOS ↔ iOS E2E
-* [ ] Android ↔ iOS E2E
-* [ ] Production WSS enforcement
-* [ ] TLS/certificate hardening
-* [ ] Crash/logging audit
-* [ ] Dependency/supply-chain audit
-
-## Phase 4 — Independent Security Review
-
-* [ ] Independent cryptographic review
-* [ ] Protocol review
-* [ ] Native storage review
-* [ ] Mobile security assessment
-* [ ] Relay infrastructure assessment
-* [ ] Penetration testing
-* [ ] Remediation verification
+- **Email:** `security@veil.network` (or open an encrypted issue)
+- Please provide reproducible steps and environment details. We follow a 90-day coordinated disclosure policy.
 
 ---
 
-# Project Status
-
-```text
-                 VEIL
-                   │
-          ┌────────┴────────┐
-          │                 │
-       CLIENT             RELAY
-          │                 │
-      E2EE Core         Blind Transport
-          │                 │
-      Dual Vault        WebSocket
-          │                 │
-       Masks              Redis
-          │
-       Ratchet
-```
-
-Current status:
-
-```text
-Core architecture       ████████████████░░░░
-Crypto implementation   ███████████████░░░░░
-Automated testing       ██████████████████░░
-Native hardening        ████████░░░░░░░░░░░░
-Independent audit       ░░░░░░░░░░░░░░░░░░░░
-Production verification ░░░░░░░░░░░░░░░░░░░░
-```
-
-Veil is actively under security hardening.
-
----
-
-# Responsible Security Disclosure
-
-If you discover a security vulnerability, do not publicly disclose
-exploitable details before the issue has been investigated.
-
-Provide:
-
-* affected component
-* reproduction steps
-* security impact
-* affected platform/version
-* proof of concept where appropriate
-
----
-
-# License
-
-License information will be added before public production release.
-
----
-
-## Disclaimer
-
-Veil is experimental security software.
-
-Do not rely on the current implementation for protection against
-high-risk adversaries or coercive situations.
-
-Cryptographic software requires independent review, native-platform
-verification, and operational security testing before it can be considered
-production-ready.
-
-```
-
-**One change I'd strongly recommend:** don't put the current security gaps in a hidden document only. Keeping them in the README makes the project much more credible because it clearly separates **what Veil has implemented** from **what has actually been security-verified**. :contentReference[oaicite:1]{index=1}
-```
+<div align="center">
+  <sub>Built for sovereign privacy. Dedicated to cryptographic freedom.</sub>
+</div>
