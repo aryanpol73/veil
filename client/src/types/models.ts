@@ -20,6 +20,10 @@ export interface Contact {
   verifiedAt: number | null;
   createdAt: number;
   verificationState: VerificationState;
+  /** Wire v2 pair secret; null until a session exists. */
+  pairSecret?: Uint8Array | null;
+  /** Invite `rz` used for first contact (initiator side only). */
+  rendezvous?: Uint8Array | null;
 }
 
 export interface Thread {

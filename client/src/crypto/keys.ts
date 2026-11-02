@@ -525,7 +525,7 @@ export const inboxCatchUpWindow = (
  * server-issued nonce so it cannot be replayed onto another connection.
  */
 export function signInboxAuth(
-  mask: MaskIdentity,
+  mask: Pick<MaskIdentity, 'signPk' | 'signSk'>,
   inboxId: string,
   serverNonce: Uint8Array,
 ): { signPk: string; signature: string } {
@@ -539,6 +539,13 @@ export function signInboxAuth(
 /* -------------------------------------------------------------------------- */
 /* Invitations — veil://invite?...                                            */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * First-contact inbox for an invite: B64U(BLAKE2b(key = rz, "veil.rz.inbox.v2")).
+ * See protocol/pairing.ts for the full wire v2 addressing scheme.
+ */
+export const rendezvousInboxId = (rz: Uint8Array): string =>
+  toB64(blake2b(utf8('veil.rz.inbox.v2'), { key: rz, dkLen: 32 }));
 
 export interface VeilInvite {
   v: 1;
@@ -642,12 +649,7 @@ export function parseInvite(uri: string): ParsedInvite | null {
     return {
       ...invite,
       fingerprint: computeFingerprint(invite.ik, invite.xk),
-      rendezvousInbox: blindedInboxId(
-        blake2b(invite.rz, {
-          dkLen: 32,
-          key: utf8(LBL.inbox).slice(0, 32),
-        }),
-      ),
+      rendezvousInbox: rendezvousInboxId(invite.rz),
     };
   } catch {
     return null;

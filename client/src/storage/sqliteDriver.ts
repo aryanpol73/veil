@@ -95,6 +95,7 @@ interface MemoryDbState {
   threads: Map<string, any>;
   ratchets: Map<string, any>;
   messages: Map<string, any>;
+  invites: Map<string, any>;
   ballast: any[];
   pageCount: number;
 }
@@ -111,6 +112,7 @@ function getOrCreateMemoryDb(name: string): MemoryDbState {
       threads: new Map(),
       ratchets: new Map(),
       messages: new Map(),
+      invites: new Map(),
       ballast: [],
       pageCount: 16,
     };
@@ -195,6 +197,8 @@ export const memoryDriver: SqlDriver = {
             verified_at: hasFpTag ? params[7] : params[6],
             created_at: hasFpTag ? params[8] : params[7],
             verification_state: params[9] ?? null,
+            pair_secret: params[10] ?? null,
+            rendezvous: params[11] ?? null,
           });
           return { rows: [], rowsAffected: 1 };
         }
@@ -223,6 +227,50 @@ export const memoryDriver: SqlDriver = {
             c.verification_state = params[1];
           }
           return { rows: [], rowsAffected: c ? 1 : 0 };
+        }
+
+        if (/UPDATE\s+contacts\s+SET\s+pair_secret\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const c = mem.contacts.get(params[1]);
+          if (c) c.pair_secret = params[0];
+          return { rows: [], rowsAffected: c ? 1 : 0 };
+        }
+
+        // Invites
+        if (/INSERT\s+INTO\s+invites/i.test(trimmed)) {
+          mem.invites.set(params[0], {
+            id: params[0],
+            rz: params[1],
+            auth_seed: params[2],
+            expires_at: params[3],
+            consumed_fp: params[4],
+            revoked: params[5],
+            created_at: params[6],
+          });
+          return { rows: [], rowsAffected: 1 };
+        }
+        if (/SELECT\s+\*\s+FROM\s+invites/i.test(trimmed)) {
+          const all = [...mem.invites.values()].sort((a, b) => b.created_at - a.created_at);
+          return { rows: all as any, rowsAffected: 0 };
+        }
+        if (/UPDATE\s+invites\s+SET\s+consumed_fp\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const inv = mem.invites.get(params[1]);
+          if (inv) inv.consumed_fp = params[0];
+          return { rows: [], rowsAffected: inv ? 1 : 0 };
+        }
+        if (/UPDATE\s+invites\s+SET\s+revoked\s*=\s*1\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const inv = mem.invites.get(params[0]);
+          if (inv) inv.revoked = 1;
+          return { rows: [], rowsAffected: inv ? 1 : 0 };
+        }
+        if (/DELETE\s+FROM\s+invites\s+WHERE\s+expires_at\s*<\s*\?/i.test(trimmed)) {
+          let n = 0;
+          for (const [id, inv] of mem.invites) {
+            if (inv.expires_at < params[0]) {
+              mem.invites.delete(id);
+              n++;
+            }
+          }
+          return { rows: [], rowsAffected: n };
         }
 
         // 7. threads table

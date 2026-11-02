@@ -178,7 +178,21 @@ CREATE TABLE IF NOT EXISTS contacts (
   fp_tag       TEXT,
   verified_at  INTEGER,
   created_at   INTEGER NOT NULL,
-  verification_state TEXT
+  verification_state TEXT,
+  pair_secret  TEXT,
+  rendezvous   TEXT
+);
+
+-- Invites this vault issued. rz and auth_seed are sealed with AEAD. A row
+-- lives until 24 h after expiry so late first messages can still be claimed.
+CREATE TABLE IF NOT EXISTS invites (
+  id           TEXT PRIMARY KEY NOT NULL,
+  rz           TEXT NOT NULL,
+  auth_seed    TEXT NOT NULL,
+  expires_at   INTEGER NOT NULL,
+  consumed_fp  TEXT,
+  revoked      INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_contacts_fp_tag ON contacts(fp_tag);
@@ -433,10 +447,12 @@ function migrate(conn: SqlConnection): void {
     } catch {
       /* ignore if column exists */
     }
-    try {
-      conn.execute('ALTER TABLE contacts ADD COLUMN verification_state TEXT');
-    } catch {
-      /* ignore if column exists */
+    for (const column of ['verification_state', 'pair_secret', 'rendezvous']) {
+      try {
+        conn.execute(`ALTER TABLE contacts ADD COLUMN ${column} TEXT`);
+      } catch {
+        /* ignore if column exists */
+      }
     }
     conn.execute('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)', ['schema_version', '1']);
   });
@@ -821,7 +837,27 @@ export interface StoredContactRecord {
   createdAt: number;
   /** 'UNVERIFIED' | 'VERIFIED' | 'CHANGED_IDENTITY'; null on legacy rows. */
   verificationState?: string | null;
+  /** Wire v2 pair secret, set once a session exists (protocol/pairing.ts). */
+  pairSecret?: Uint8Array | null;
+  /** Invite `rz` used to reach this contact before the session is confirmed. */
+  rendezvous?: Uint8Array | null;
 }
+
+const sealOptional = (
+  key: Uint8Array,
+  bytes: Uint8Array | null | undefined,
+  aad: string,
+): string | null => (bytes ? packSealed(aeadEncrypt(key, bytes, utf8(aad))) : null);
+
+const openOptional = (
+  key: Uint8Array,
+  stored: unknown,
+  aad: string,
+): Uint8Array | null => {
+  if (typeof stored !== 'string') return null;
+  const sealed = unpackSealed(stored);
+  return sealed ? aeadDecrypt(key, sealed, utf8(aad)) : null;
+};
 
 export function computeContactFpTag(fingerprint: string, vaultKey?: Uint8Array): string {
   const key = vaultKey ?? active?.vaultKey;
@@ -846,8 +882,9 @@ export function saveContactRow(
 
   conn.execute(
     `INSERT OR REPLACE INTO contacts
-     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at, verification_state)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at,
+      verification_state, pair_secret, rendezvous)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       contact.id,
       contact.maskIndex,
@@ -859,6 +896,8 @@ export function saveContactRow(
       contact.verifiedAt,
       contact.createdAt,
       contact.verificationState ?? null,
+      sealOptional(key, contact.pairSecret, `contact|${contact.id}|pair_secret`),
+      sealOptional(key, contact.rendezvous, `contact|${contact.id}|rendezvous`),
     ],
   );
 }
@@ -917,6 +956,8 @@ function parseContactRow(row: any, vaultKey: Uint8Array): StoredContactRecord | 
       verifiedAt: row.verified_at ?? null,
       createdAt: row.created_at,
       verificationState: row.verification_state ?? null,
+      pairSecret: openOptional(vaultKey, row.pair_secret, `contact|${id}|pair_secret`),
+      rendezvous: openOptional(vaultKey, row.rendezvous, `contact|${id}|rendezvous`),
     };
   } catch {
     return null;
@@ -966,6 +1007,93 @@ export function updateContactVerification(
     verificationState,
     id,
   ]);
+}
+
+export function updateContactPairSecret(id: string, pairSecret: Uint8Array): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  getDb().execute('UPDATE contacts SET pair_secret = ? WHERE id = ?', [
+    sealOptional(active.vaultKey, pairSecret, `contact|${id}|pair_secret`),
+    id,
+  ]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Invites issued by this vault                                               */
+/* -------------------------------------------------------------------------- */
+
+export interface StoredInvite {
+  id: string;
+  rz: Uint8Array;
+  authSeed: Uint8Array;
+  expiresAt: number;
+  consumedFp: string | null;
+  revoked: boolean;
+  createdAt: number;
+}
+
+/** How long after expiry an invite's rendezvous inbox is still watched. */
+export const INVITE_GRACE_MS = 24 * 3_600_000;
+
+export function saveInvite(invite: { id: string; rz: Uint8Array; authSeed: Uint8Array; expiresAt: number }): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  const key = active.vaultKey;
+  getDb().execute(
+    `INSERT INTO invites (id, rz, auth_seed, expires_at, consumed_fp, revoked, created_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [
+      invite.id,
+      sealOptional(key, invite.rz, `invite|${invite.id}|rz`),
+      sealOptional(key, invite.authSeed, `invite|${invite.id}|auth_seed`),
+      invite.expiresAt,
+      null,
+      0,
+      Date.now(),
+    ],
+  );
+}
+
+/** Invites whose rendezvous inbox should still be watched, newest first. */
+export function listLiveInvites(now: number = Date.now()): StoredInvite[] {
+  if (!active) return [];
+  const key = active.vaultKey;
+  const rows = getDb().execute<any>('SELECT * FROM invites ORDER BY created_at DESC').rows ?? [];
+  const out: StoredInvite[] = [];
+  for (const r of rows) {
+    if (r.revoked || r.expires_at + INVITE_GRACE_MS < now) continue;
+    const rz = openOptional(key, r.rz, `invite|${r.id}|rz`);
+    const authSeed = openOptional(key, r.auth_seed, `invite|${r.id}|auth_seed`);
+    if (!rz || !authSeed) continue;
+    const fp = openOptional(key, r.consumed_fp, `invite|${r.id}|consumed_fp`);
+    out.push({
+      id: r.id,
+      rz,
+      authSeed,
+      expiresAt: r.expires_at,
+      consumedFp: fp ? fromUtf8(fp) : null,
+      revoked: !!r.revoked,
+      createdAt: r.created_at,
+    });
+  }
+  return out;
+}
+
+export function markInviteConsumed(id: string, fingerprint: string): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  getDb().execute('UPDATE invites SET consumed_fp = ? WHERE id = ?', [
+    sealOptional(active.vaultKey, utf8(fingerprint), `invite|${id}|consumed_fp`),
+    id,
+  ]);
+}
+
+export function revokeInvite(id: string): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  getDb().execute('UPDATE invites SET revoked = 1 WHERE id = ?', [id]);
+}
+
+/** Drops invite rows past their grace period. */
+export function pruneInvites(now: number = Date.now()): void {
+  if (!active) return;
+  getDb().execute('DELETE FROM invites WHERE expires_at < ?', [now - INVITE_GRACE_MS]);
 }
 
 /**

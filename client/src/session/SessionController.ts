@@ -28,6 +28,9 @@ export function beginSession(): MaskIdentity | null {
   if (!seed) return null;
   try {
     const mask = identityManager.setIdentity(seed, activeMaskIndex());
+    // Connect even with nothing to subscribe to yet (no contacts, no
+    // invites), so the first send does not wait on a socket.
+    relayClient.connect();
     messageService.setActiveMask(mask);
     return mask;
   } finally {

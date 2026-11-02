@@ -1,54 +1,71 @@
 /**
  * ============================================================================
- *  VEIL — COMPLETE MESSAGE SERVICE & PIPELINE ORCHESTRATION
+ *  VEIL — COMPLETE MESSAGE SERVICE & PIPELINE ORCHESTRATION (wire v2)
  * ============================================================================
  *  Orchestrates the end-to-end messaging pipeline:
  *
  *    Outbound:
- *      Composer -> MessageService -> RatchetManager (AEAD encrypt)
- *      -> EnvelopeCodec (4096-byte pad) -> Local Storage (Vault / RamVault)
- *      -> RelayClient (SEND) -> Relay ACCEPTED -> markDelivered()
+ *      Composer -> MessageService -> RatchetManager (body AEAD)
+ *      -> SealedEnvelope (header + padding under the inbox's header key)
+ *      -> Local Storage (Vault / RamVault) -> RelayClient (SEND) -> ACCEPTED
  *
  *    Inbound:
- *      Relay (DELIVER) -> RelayClient -> EnvelopeCodec (unpad)
- *      -> RatchetManager (AEAD decrypt) -> Local Storage, in ONE transaction
+ *      Relay (DELIVER) -> RelayClient -> route by inbox -> SealedEnvelope open
+ *      -> RatchetManager (body AEAD) -> Local Storage, in ONE transaction
  *      -> return true -> RelayClient ACKs (relay deletes its copy)
+ *
+ *  Addressing (see protocol/pairing.ts):
+ *    - Before a reply has been received, the initiator writes to the invite's
+ *      rendezvous inbox and attaches a sealed, signed intro.
+ *    - Once a session exists, each side writes to the other's pair inbox,
+ *      derived from the pair secret. The relay never sees an identity key,
+ *      fingerprint, ratchet header or message length.
  *
  *  Ensures:
  *   - No UI component directly performs cryptography.
  *   - No UI component manages WebSocket protocol frames.
- *   - No relay module sees or decrypts message content.
  *   - The relay copy is only deleted after the message is durably stored.
  *   - A session is only started from a first message carrying a valid,
- *     signed initiator introduction (see protocol/intro.ts).
+ *     signed initiator introduction, through a live invite of ours, and each
+ *     invite admits exactly one initiator.
  * ============================================================================
  */
 
-import {
-  blindedInboxId,
-  inboxCatchUpWindow,
-  fromB64,
-  wipe,
-  type MaskIdentity,
-} from '../crypto/keys';
+import { createInvite as buildInvite, fromB64, randomBytes, wipe, type MaskIdentity } from '../crypto/keys';
 import {
   insertMessage,
   isVaultOpen,
+  listLiveInvites,
   markDelivered,
+  markInviteConsumed,
   newLocalId,
+  pruneInvites,
+  saveInvite,
   withTransaction,
   type StoredMessage,
 } from '../storage/db';
 import { contactManager } from '../protocol/contacts/ContactManager';
-import { createIntro, decodeInner, encodeInner, verifyIntro } from '../protocol/intro';
+import { createIntro, decodeInner, encodeInner, openIntro, sealIntro, verifyIntro } from '../protocol/intro';
+import {
+  introKeyFromRoot,
+  pairHeaderKey,
+  pairInboxId,
+  pairInboxSigner,
+  pairInboxWindow,
+  pairSecretFromRoot,
+  rendezvousHeaderKey,
+  rendezvousInboxId,
+  rendezvousSigner,
+  type InboxSigner,
+} from '../protocol/pairing';
 import {
   initBobSession,
   ratchetDecryptMessage,
   type RatchetEncryptedPayload,
 } from '../protocol/ratchet';
-import { EnvelopeCodec } from '../transport/EnvelopeCodec';
+import { openEnvelope, sealEnvelope, toWireHeader, type InnerEnvelope } from '../transport/SealedEnvelope';
 import { relayClient, RelayClient } from '../transport/RelayClient';
-import type { Contact, RetentionMode, WireEnvelope } from '../types/models';
+import type { Contact, RetentionMode } from '../types/models';
 import { ratchetManager, RatchetManager } from './RatchetManager';
 
 const encoder = new TextEncoder();
@@ -56,13 +73,15 @@ const utf8 = (s: string) => encoder.encode(s);
 
 /**
  * Largest message body accepted from the composer, in UTF-8 bytes. Leaves
- * headroom inside the 4096-byte envelope for the header, intro and base64
+ * headroom inside the sealed envelope for the header, intro and base64
  * expansion, so an accepted message can always be encoded.
  */
 export const MAX_MESSAGE_BYTES = 2000;
 
 const RETENTION_MODES: RetentionMode[] = ['persistent', 'timed', 'viewOnce'];
-const HOUR_MS = 3_600_000;
+
+/** Subscriptions are refreshed this often so pair-inbox epochs roll over. */
+const REFRESH_MS = 15 * 60_000;
 
 export class MessageTooLargeError extends Error {
   constructor(public readonly bytes: number) {
@@ -76,12 +95,17 @@ export const threadIdFor = (contact: Pick<Contact, 'id'>): string => `th_${conta
 
 const conversationIdFor = (a: string, b: string): string => [a, b].sort().join(':');
 
+type Route =
+  | { kind: 'pair'; contactId: string; headerKey: Uint8Array }
+  | { kind: 'rendezvous'; inviteId: string; headerKey: Uint8Array; consumedFp: string | null };
+
 export class MessageService {
   private relay: RelayClient;
   private ratchets: RatchetManager;
   private messageListeners = new Set<MessageListener>();
   private subscribed = new Map<string, () => void>();
-  private epochTimer: ReturnType<typeof setTimeout> | null = null;
+  private routes = new Map<string, Route>();
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private activeMask: MaskIdentity | null = null;
 
   constructor(relay: RelayClient = relayClient, ratchets: RatchetManager = ratchetManager) {
@@ -92,8 +116,16 @@ export class MessageService {
   /** Binds the service to an unlocked identity, or detaches it on lock (null). */
   public setActiveMask(mask: MaskIdentity | null): void {
     this.activeMask = mask;
+    if (mask) pruneInvites();
     this.refreshSubscriptions();
-    this.scheduleEpochRefresh();
+
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = null;
+    if (mask) {
+      const timer = setInterval(() => this.refreshSubscriptions(), REFRESH_MS);
+      (timer as { unref?: () => void }).unref?.();
+      this.refreshTimer = timer;
+    }
   }
 
   public onMessage(listener: MessageListener): () => void {
@@ -112,11 +144,52 @@ export class MessageService {
   }
 
   /**
-   * Brings relay subscriptions in line with the current catch-up window
-   * (last 24 epochs, current, next). Only the difference is (un)subscribed.
+   * Issues an invite and starts watching its rendezvous inbox. The claim key
+   * for that inbox comes from a private seed kept in the vault, so holders of
+   * the invite can write to the inbox but cannot claim it.
+   */
+  public createInvite(opts: { ttlSeconds?: number; nick?: string } = {}): { uri: string; expiresAt: number } {
+    const mask = this.activeMask;
+    if (!mask) throw new Error('[veil/messaging] no active identity');
+    const { uri, rendezvous, expiresAt } = buildInvite(mask, opts);
+    saveInvite({ id: newLocalId('inv'), rz: rendezvous, authSeed: randomBytes(32), expiresAt });
+    this.refreshSubscriptions();
+    return { uri, expiresAt };
+  }
+
+  /**
+   * Brings relay subscriptions in line with what this vault should receive:
+   * every contact's pair-inbox window and every live invite's rendezvous
+   * inbox. Only the difference is (un)subscribed.
    */
   public refreshSubscriptions(): void {
-    const wanted = new Set(this.activeMask ? inboxCatchUpWindow(this.activeMask.dhPk) : []);
+    const mask = this.activeMask;
+    const wanted = new Map<string, { route: Route; signer: InboxSigner }>();
+
+    if (mask && isVaultOpen()) {
+      for (const contact of contactManager.listContacts()) {
+        const secret = contact.pairSecret;
+        if (!secret) continue;
+        const headerKey = pairHeaderKey(secret, mask.signPk);
+        for (const inbox of pairInboxWindow(secret, mask.signPk)) {
+          wanted.set(inbox, {
+            route: { kind: 'pair', contactId: contact.id, headerKey },
+            signer: pairInboxSigner(secret, inbox),
+          });
+        }
+      }
+      for (const invite of listLiveInvites()) {
+        wanted.set(rendezvousInboxId(invite.rz), {
+          route: {
+            kind: 'rendezvous',
+            inviteId: invite.id,
+            headerKey: rendezvousHeaderKey(invite.rz),
+            consumedFp: invite.consumedFp,
+          },
+          signer: rendezvousSigner(invite.authSeed),
+        });
+      }
+    }
 
     for (const [inbox, unsub] of this.subscribed) {
       if (wanted.has(inbox)) continue;
@@ -128,30 +201,12 @@ export class MessageService {
       this.subscribed.delete(inbox);
     }
 
-    const mask = this.activeMask;
-    if (!mask) return;
-    for (const inbox of wanted) {
+    this.routes = new Map([...wanted].map(([inbox, w]) => [inbox, w.route]));
+    for (const [inbox, { signer }] of wanted) {
       if (this.subscribed.has(inbox)) continue;
-      const unsub = this.relay.subscribe(inbox, mask, (envelope, rawId) =>
-        this.handleInboundEnvelope(envelope, rawId),
-      );
+      const unsub = this.relay.subscribe(inbox, signer, (env) => this.handleInbound(inbox, env));
       this.subscribed.set(inbox, unsub);
     }
-  }
-
-  /** Re-runs refreshSubscriptions just after every epoch-hour boundary. */
-  private scheduleEpochRefresh(): void {
-    if (this.epochTimer) clearTimeout(this.epochTimer);
-    this.epochTimer = null;
-    if (!this.activeMask) return;
-
-    const delay = HOUR_MS - (Date.now() % HOUR_MS) + 1_000;
-    const timer = setTimeout(() => {
-      this.refreshSubscriptions();
-      this.scheduleEpochRefresh();
-    }, delay);
-    (timer as { unref?: () => void }).unref?.();
-    this.epochTimer = timer;
   }
 
   /**
@@ -167,7 +222,8 @@ export class MessageService {
     senderFp: string;
     msgId?: string;
   }): Promise<StoredMessage> {
-    const { threadId, contact, body, retention, ttlMs, senderFp } = params;
+    const { threadId, retention, ttlMs, senderFp, body } = params;
+    let contact = params.contact;
     const mask = this.activeMask;
     if (!mask) throw new Error('[veil/messaging] no active identity');
 
@@ -175,18 +231,26 @@ export class MessageService {
     if (bodyBytes > MAX_MESSAGE_BYTES) throw new MessageTooLargeError(bodyBytes);
 
     const msgId = params.msgId ?? newLocalId('m');
-
-    // 1. Until the peer has replied, introduce ourselves inside the ciphertext
-    //    so they can authenticate us and route replies to our inbox.
     const state = this.ratchets.ensureOutgoingSession(threadId, contact);
-    const intro = this.ratchets.hasReceived(threadId)
-      ? undefined
-      : createIntro(mask, state.localDhPk, contact.signPk, contact.dhPk);
+    const replied = this.ratchets.hasReceived(threadId);
 
-    // 2. Encrypt with the Double Ratchet, binding the symmetric conversation ID.
+    // Before any reply, the root key is still the session's initial one, so
+    // both the pair secret and the intro key can be derived from it here.
+    let introKey: Uint8Array | null = null;
+    if (!replied) {
+      introKey = introKeyFromRoot(state.rootKey);
+      if (!contact.pairSecret) {
+        const secret = pairSecretFromRoot(state.rootKey);
+        contactManager.setPairSecret(contact.id, secret);
+        contact = { ...contact, pairSecret: secret };
+        this.refreshSubscriptions(); // start listening for the reply
+      }
+    }
+    if (!contact.pairSecret) throw new Error('[veil/messaging] session has no pair secret');
+
     const encrypted = this.ratchets.encrypt(
       threadId,
-      encodeInner({ body, intro }),
+      encodeInner({ body }),
       retention,
       senderFp,
       msgId,
@@ -194,74 +258,76 @@ export class MessageService {
       ttlMs,
       conversationIdFor(senderFp, contact.fingerprint),
     );
+    const header = toWireHeader(encrypted.header);
 
-    // 3. Encode and pad to uniform 4,096 bytes for the recipient's current inbox.
-    const targetInbox = blindedInboxId(contact.dhPk);
-    const paddedEnvelope = EnvelopeCodec.encode({
-      inbox: targetInbox,
-      header: encrypted.header,
+    const viaRendezvous = !replied && !!contact.rendezvous;
+    const inbox = viaRendezvous
+      ? rendezvousInboxId(contact.rendezvous!)
+      : pairInboxId(contact.pairSecret, contact.signPk);
+    const headerKey = viaRendezvous
+      ? rendezvousHeaderKey(contact.rendezvous!)
+      : pairHeaderKey(contact.pairSecret, contact.signPk);
+
+    const inner: InnerEnvelope = {
+      header,
       nonce: encrypted.nonce,
       ciphertext: encrypted.ciphertext,
-      id: msgId,
-    });
+    };
+    if (introKey) {
+      const intro = createIntro(mask, state.localDhPk, contact.signPk, contact.dhPk);
+      inner.intro = sealIntro(intro, introKey, header.dhPk);
+      wipe(introKey);
+    }
+    const sealed = sealEnvelope(headerKey, inbox, inner);
 
-    // 4. Store locally only once the message is known to be encodable.
-    const stored = insertMessage({
-      id: msgId,
-      threadId,
-      direction: 'out',
-      retention,
-      body,
-      ttlMs,
-    });
+    const stored = insertMessage({ id: msgId, threadId, direction: 'out', retention, body, ttlMs });
     this.notifyListeners(stored);
 
-    // 5. Dispatch across the blind relay and wait for acceptance.
     try {
-      await this.relay.sendEnvelope(targetInbox, paddedEnvelope);
+      await this.relay.sendEnvelope(inbox, sealed);
       markDelivered(msgId);
       stored.delivered_at = Date.now();
     } catch {
       // Not accepted by the relay; the bubble shows it as undelivered.
     }
-
     return stored;
   }
 
   /**
-   * Processes an inbound envelope. Returns true when the relay copy may be
-   * deleted: the message was committed, or it can never be processed (forged,
-   * malformed, not for us). Returns false to leave it at the relay, e.g. when
-   * the vault is locked or the local write failed.
+   * Processes an envelope that arrived on `inbox`. Returns true when the relay
+   * copy may be deleted: the message was committed, or it can never be
+   * processed (forged, malformed, not for us). Returns false to leave it at
+   * the relay, e.g. when the vault is locked or the local write failed.
    */
-  public handleInboundEnvelope(envelope: WireEnvelope, _rawId: string): boolean {
+  public handleInbound(inbox: string, envelopeB64: string): boolean {
     const mask = this.activeMask;
     if (!mask || !isVaultOpen()) return false;
+    const route = this.routes.get(inbox);
+    if (!route) return false;
 
-    let payload: RatchetEncryptedPayload;
+    const inner = openEnvelope(route.headerKey, inbox, envelopeB64);
+    if (!inner || !RETENTION_MODES.includes(inner.header.retention)) return true;
+
     let remoteDhPk: Uint8Array;
     try {
-      remoteDhPk = fromB64(envelope.header.dhPk);
-      payload = {
-        header: envelope.header,
-        nonce: fromB64(envelope.nonce),
-        ciphertext: fromB64(envelope.ciphertext),
-      };
+      remoteDhPk = fromB64(inner.header.dhPk);
     } catch {
       return true;
     }
+    if (remoteDhPk.length !== 32) return true;
 
-    const senderFp = envelope.header.senderFp;
-    if (!senderFp || remoteDhPk.length !== 32) return true;
-    if (!RETENTION_MODES.includes(envelope.header.retention)) return true;
+    const payload: RatchetEncryptedPayload = {
+      header: inner.header,
+      nonce: inner.nonce,
+      ciphertext: inner.ciphertext,
+    };
 
-    const conversationId = conversationIdFor(senderFp, mask.fingerprint);
-    const known = contactManager.getContactByFingerprint(senderFp);
-
-    if (known && this.ratchets.getOrLoadRatchet(threadIdFor(known))) {
-      return this.receiveOnSession(known, payload, senderFp, mask, remoteDhPk, conversationId);
+    if (route.kind === 'pair') {
+      const contact = contactManager.getContact(route.contactId);
+      if (!contact || !this.ratchets.getOrLoadRatchet(threadIdFor(contact))) return true;
+      return this.receiveOnSession(contact, payload, contact.fingerprint, mask, remoteDhPk);
     }
-    return this.receiveFirstContact(known, payload, senderFp, mask, remoteDhPk, conversationId);
+    return this.receiveViaRendezvous(route, inner, payload, mask, remoteDhPk);
   }
 
   private receiveOnSession(
@@ -270,7 +336,6 @@ export class MessageService {
     senderFp: string,
     mask: MaskIdentity,
     remoteDhPk: Uint8Array,
-    conversationId: string,
   ): boolean {
     const threadId = threadIdFor(contact);
     let stored: StoredMessage | null = null;
@@ -282,7 +347,7 @@ export class MessageService {
           senderFp,
           mask,
           remoteDhPk,
-          conversationId,
+          conversationIdFor(senderFp, mask.fingerprint),
           false,
         );
         if (!pt) return;
@@ -301,51 +366,73 @@ export class MessageService {
   }
 
   /**
-   * First message of a session. Only accepted if it carries an introduction
-   * signed by the initiator's identity key whose fingerprint matches the
-   * claimed sender. A first message can never be grafted onto an existing
-   * contact's established session.
+   * A message on one of our invites' rendezvous inboxes. Accepted only with
+   * an intro that opens under this session's key, verifies against the
+   * initiator's identity key, and comes from the invite's one initiator.
    */
-  private receiveFirstContact(
-    known: Contact | null,
+  private receiveViaRendezvous(
+    route: Extract<Route, { kind: 'rendezvous' }>,
+    inner: InnerEnvelope,
     payload: RatchetEncryptedPayload,
-    senderFp: string,
     mask: MaskIdentity,
     remoteDhPk: Uint8Array,
-    conversationId: string,
   ): boolean {
+    if (!inner.intro) return true;
+
     const state = initBobSession(mask.dhSk, mask.dhPk, remoteDhPk);
-    const pt = ratchetDecryptMessage({ state, payload, threadId: conversationId, senderFp });
+    const introKey = introKeyFromRoot(state.rootKey);
+    const intro = openIntro(inner.intro, introKey, inner.header.dhPk);
+    wipe(introKey);
+    if (!intro) return true;
+    const fp = verifyIntro(intro, remoteDhPk, mask);
+    if (!fp) return true;
+
+    // Single use: once an invite has paired, it admits no other initiator.
+    if (route.consumedFp && route.consumedFp !== fp) return true;
+
+    const known = contactManager.getContactBySignPk(intro.ik);
+    if (known && known.fingerprint !== fp) return true; // same identity, other keys
+    if (known && this.ratchets.getOrLoadRatchet(threadIdFor(known))) {
+      // A later message the initiator sent before seeing our reply.
+      return this.receiveOnSession(known, payload, fp, mask, remoteDhPk);
+    }
+
+    const pairSecret = pairSecretFromRoot(state.rootKey);
+    const pt = ratchetDecryptMessage({
+      state,
+      payload,
+      threadId: conversationIdFor(fp, mask.fingerprint),
+      senderFp: fp,
+    });
     if (!pt) return true;
-    const inner = decodeInner(pt);
+    const body = decodeInner(pt);
     wipe(pt);
-    if (!inner?.intro) return true;
+    if (!body) return true;
 
-    const introFp = verifyIntro(inner.intro, remoteDhPk, mask);
-    if (!introFp || introFp !== senderFp) return true;
-
-    const intro = inner.intro;
     let threadId: string | null = null;
     let stored: StoredMessage | null = null;
     try {
       withTransaction(() => {
-        const contact =
-          known ??
-          contactManager.saveContact({
-            maskIndex: mask.index,
-            alias: `Peer ${introFp.slice(0, 4)}`,
-            signPk: intro.ik,
-            dhPk: intro.xk,
-          });
+        const contact = contactManager.saveContact({
+          id: known?.id,
+          maskIndex: mask.index,
+          alias: known?.alias ?? `Peer ${fp.slice(0, 4)}`,
+          signPk: intro.ik,
+          dhPk: intro.xk,
+          pairSecret,
+        });
         threadId = threadIdFor(contact);
         contactManager.ensureThread(contact);
         this.ratchets.adoptSession(threadId, state);
-        stored = this.storeInbound(threadId, payload, inner.body);
+        if (!route.consumedFp) markInviteConsumed(route.inviteId, fp);
+        stored = this.storeInbound(threadId, payload, body.body);
       });
     } catch {
       if (threadId) this.ratchets.purge(threadId);
       return false;
     }
+    // Start listening on the new pair inbox, and pin the invite to this initiator.
+    this.refreshSubscriptions();
     if (stored) this.notifyListeners(stored);
     return true;
   }

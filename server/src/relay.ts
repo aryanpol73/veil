@@ -63,9 +63,9 @@ const CONFIG = {
   maxClaims: 500_000,
 
   /** Per-connection limits. */
-  maxSubsPerConn: 64,
-  ratePerSec: 20,
-  rateBurst: 60,
+  maxSubsPerConn: 1024, // wire v2: a few inboxes per contact
+  ratePerSec: 50,
+  rateBurst: 200,
   idleTimeoutMs: 90_000,
   heartbeatMs: 25_000,
 

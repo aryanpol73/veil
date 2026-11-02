@@ -39,7 +39,8 @@ import { endSession } from '../session/SessionController';
 import { ratchetManager } from '../messaging/RatchetManager';
 import { identityManager } from '../identity/IdentityManager';
 import { contactManager } from '../protocol/contacts/ContactManager';
-import { createInvite, type ParsedInvite } from '../crypto/keys';
+import { type ParsedInvite } from '../crypto/keys';
+import { messageService } from '../messaging/MessageService';
 import { relayClient, type ConnectionStatus } from '../transport/RelayClient';
 import type { Thread } from '../types/models';
 import type { RootNavigationProp } from '../types/navigation';
@@ -111,7 +112,7 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
         /* ignore */
       }
     }
-    const { uri } = createInvite(activeMask);
+    const { uri } = messageService.createInvite();
     setGeneratedInviteUri(uri);
     setShowInviteModal(true);
   };

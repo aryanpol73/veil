@@ -2,14 +2,17 @@
  * ============================================================================
  *  VEIL — INNER PAYLOAD & INITIATOR INTRODUCTION
  * ============================================================================
- *  Everything below lives INSIDE the ratchet AEAD; the relay never sees it.
+ *  Body plaintext (inside the ratchet AEAD; UTF-8 JSON):
+ *    { "v": 1, "body": "<text>" }
  *
- *  Inner payload v1 (UTF-8 JSON):
- *    { "v": 1, "body": "<text>", "intro"?: { "ik", "xk", "sig" } }
- *
- *  The initiator (the party who imported an invite) attaches `intro` to every
- *  message until it has received a reply. It carries the initiator's real
- *  identity keys plus an Ed25519 signature that binds them to this session:
+ *  Intro (initiator only, until it has received a reply). Sealed with
+ *  XChaCha20-Poly1305 under a key derived from the session's INITIAL root key
+ *  (pairing.introKeyFromRoot), AAD = "veil.intro.v2|" + header.dhPk, and
+ *  carried in the sealed envelope next to the header. Only the recipient can
+ *  derive that key, so other holders of the invite cannot read it. The
+ *  recipient needs it BEFORE opening the body, because the body's AAD binds
+ *  the initiator's fingerprint. It carries the initiator's real identity keys
+ *  plus an Ed25519 signature that binds them to this session:
  *
  *    sig = Ed25519.sign(ik_sk,
  *            "veil.intro.v1|" || initiatorEphemeralDhPk || recipientIk || recipientXk)
@@ -26,7 +29,16 @@
  */
 
 import { ed25519 } from '@noble/curves/ed25519.js';
-import { computeFingerprint, fromB64, toB64, type MaskIdentity } from '../crypto/keys';
+import {
+  aeadDecrypt,
+  aeadEncrypt,
+  computeFingerprint,
+  fromB64,
+  packSealed,
+  toB64,
+  unpackSealed,
+  type MaskIdentity,
+} from '../crypto/keys';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -41,7 +53,6 @@ export interface Intro {
 
 export interface InnerPayload {
   body: string;
-  intro?: Intro;
 }
 
 function introPreimage(
@@ -90,26 +101,37 @@ export function verifyIntro(
 }
 
 export function encodeInner(payload: InnerPayload): Uint8Array {
-  const obj: Record<string, unknown> = { v: 1, body: payload.body };
-  if (payload.intro) {
-    obj.intro = {
-      ik: toB64(payload.intro.ik),
-      xk: toB64(payload.intro.xk),
-      sig: toB64(payload.intro.sig),
-    };
-  }
-  return encoder.encode(JSON.stringify(obj));
+  return encoder.encode(JSON.stringify({ v: 1, body: payload.body }));
 }
 
-/** Returns null for anything that is not a well-formed v1 inner payload. */
+/** Returns null for anything that is not a well-formed v1 body payload. */
 export function decodeInner(bytes: Uint8Array): InnerPayload | null {
   try {
     const obj = JSON.parse(decoder.decode(bytes));
     if (!obj || obj.v !== 1 || typeof obj.body !== 'string') return null;
-    if (obj.intro === undefined) return { body: obj.body };
-    const { ik, xk, sig } = obj.intro ?? {};
+    return { body: obj.body };
+  } catch {
+    return null;
+  }
+}
+
+const introAad = (dhPk: string) => encoder.encode(`veil.intro.v2|${dhPk}`);
+
+/** Seals an intro for the envelope. `dhPk` is the header's (b64u) DH key. */
+export function sealIntro(intro: Intro, introKey: Uint8Array, dhPk: string): string {
+  const json = JSON.stringify({ ik: toB64(intro.ik), xk: toB64(intro.xk), sig: toB64(intro.sig) });
+  return packSealed(aeadEncrypt(introKey, encoder.encode(json), introAad(dhPk)));
+}
+
+export function openIntro(packed: string, introKey: Uint8Array, dhPk: string): Intro | null {
+  const sealed = unpackSealed(packed);
+  if (!sealed) return null;
+  const pt = aeadDecrypt(introKey, sealed, introAad(dhPk));
+  if (!pt) return null;
+  try {
+    const { ik, xk, sig } = JSON.parse(decoder.decode(pt));
     if (typeof ik !== 'string' || typeof xk !== 'string' || typeof sig !== 'string') return null;
-    return { body: obj.body, intro: { ik: fromB64(ik), xk: fromB64(xk), sig: fromB64(sig) } };
+    return { ik: fromB64(ik), xk: fromB64(xk), sig: fromB64(sig) };
   } catch {
     return null;
   }

@@ -22,6 +22,7 @@ import {
   loadContactRowByFingerprint,
   listContactRows,
   updateContactVerification,
+  updateContactPairSecret,
   type StoredContactRecord,
 } from '../../storage/db';
 import type { Contact, Thread, VerificationState } from '../../types/models';
@@ -33,6 +34,9 @@ export interface CreateContactInput {
   signPk: Uint8Array;
   dhPk: Uint8Array;
   verified?: boolean;
+  /** Omitted: keep the stored value. null: clear it. */
+  pairSecret?: Uint8Array | null;
+  rendezvous?: Uint8Array | null;
 }
 
 const VERIFICATION_STATES: VerificationState[] = ['UNVERIFIED', 'VERIFIED', 'CHANGED_IDENTITY'];
@@ -100,6 +104,10 @@ export class ContactManager {
     }
 
     const verifiedAt = state === 'VERIFIED' ? (existing?.verifiedAt ?? now) : null;
+    const pairSecret =
+      input.pairSecret !== undefined ? input.pairSecret : (existing?.pairSecret ?? null);
+    const rendezvous =
+      input.rendezvous !== undefined ? input.rendezvous : (existing?.rendezvous ?? null);
 
     saveContactRow({
       id,
@@ -111,6 +119,8 @@ export class ContactManager {
       verifiedAt,
       createdAt: existing?.createdAt ?? now,
       verificationState: state,
+      pairSecret,
+      rendezvous,
     });
 
     return {
@@ -123,7 +133,14 @@ export class ContactManager {
       verifiedAt,
       createdAt: existing?.createdAt ?? now,
       verificationState: state,
+      pairSecret,
+      rendezvous,
     };
+  }
+
+  /** Records the wire v2 pair secret once a session with this contact exists. */
+  public setPairSecret(id: string, pairSecret: Uint8Array): void {
+    updateContactPairSecret(id, pairSecret);
   }
 
   /**
@@ -149,6 +166,7 @@ export class ContactManager {
     // Same identity key + same exchange key: reuse. Same identity key + new
     // exchange key: flag CHANGED_IDENTITY on the existing record (audit A-11).
     const known = this.getContactBySignPk(invite.ik);
+    const keysChanged = !!known && !timingSafeEqual(known.dhPk, invite.xk);
     const contact = this.saveContact({
       id: known?.id,
       maskIndex,
@@ -156,6 +174,10 @@ export class ContactManager {
       signPk: invite.ik,
       dhPk: invite.xk,
       verified: false,
+      // A fresh invite starts first contact again through its rendezvous
+      // inbox, unless a session already exists with these same keys.
+      rendezvous: known && !keysChanged && known.pairSecret ? known.rendezvous : invite.rz,
+      ...(keysChanged ? { pairSecret: null } : {}),
     });
 
     const threadId = `th_${contact.id}`;
@@ -214,6 +236,8 @@ export class ContactManager {
       verifiedAt: r.verifiedAt,
       createdAt: r.createdAt,
       verificationState: state,
+      pairSecret: r.pairSecret ?? null,
+      rendezvous: r.rendezvous ?? null,
     };
   }
 }
