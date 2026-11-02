@@ -79,6 +79,7 @@ import {
 import { contactManager } from '../protocol/contacts/ContactManager';
 import { identityManager } from '../identity/IdentityManager';
 import {
+  IdentityChangedError,
   MAX_MESSAGE_BYTES,
   MessageTooLargeError,
   messageService,
@@ -531,7 +532,8 @@ const FrostedHeader: React.FC<{
   verified: boolean;
   maskLabel: string;
   onBack: () => void;
-}> = ({ alias, fingerprint, verified, maskLabel, onBack }) => {
+  onVerify?: () => void;
+}> = ({ alias, fingerprint, verified, maskLabel, onBack, onVerify }) => {
   const insets = useSafeAreaInsets();
   return (
     <View style={[styles.header, { paddingTop: insets.top + Space.sm }]}>
@@ -550,7 +552,13 @@ const FrostedHeader: React.FC<{
             <Text style={[Type.h2, { color: Palette.prismCyan }]}>‹</Text>
           </Pressable>
 
-          <View style={styles.headerCenter}>
+          <Pressable
+            style={styles.headerCenter}
+            onPress={onVerify}
+            disabled={!onVerify}
+            accessibilityRole="button"
+            accessibilityLabel={`Safety number for ${alias}`}
+          >
             <View style={styles.aliasRow}>
               <Text style={Type.h2} numberOfLines={1}>
                 {alias}
@@ -572,7 +580,7 @@ const FrostedHeader: React.FC<{
                 {fingerprint}
               </Text>
             </View>
-          </View>
+          </Pressable>
 
           <View style={styles.maskChip}>
             <Specular />
@@ -636,7 +644,8 @@ const Composer: React.FC<{
   onTtlChange: (ms: number) => void;
   /** Resolves true once the message is accepted; the draft is kept otherwise. */
   onSend: (text: string) => Promise<boolean>;
-}> = ({ mode, ttlMs, onModeChange, onTtlChange, onSend }) => {
+  disabled?: boolean;
+}> = ({ mode, ttlMs, onModeChange, onTtlChange, onSend, disabled = false }) => {
   const insets = useSafeAreaInsets();
   const [text, setText] = useState('');
   const [focused, setFocused] = useState(false);
@@ -645,7 +654,7 @@ const Composer: React.FC<{
   const trimmed = text.trim();
   const byteLength = useMemo(() => textEncoder.encode(trimmed).length, [trimmed]);
   const tooLong = byteLength > MAX_MESSAGE_BYTES;
-  const canSend = trimmed.length > 0 && !tooLong;
+  const canSend = trimmed.length > 0 && !tooLong && !disabled;
 
   const sendStyle = useAnimatedStyle(() => ({
     transform: [{ scale: interpolate(sendScale.value, [0, 1], [1, 0.88]) }],
@@ -792,6 +801,13 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   const effectiveThreadId = route?.params?.threadId ?? threadId ?? '';
   const effectiveContactId = route?.params?.contactId;
 
+  // Bumped when the screen regains focus, e.g. back from the Verify screen.
+  const [contactVersion, setContactVersion] = useState(0);
+  useEffect(() => {
+    const unsub = navigation?.addListener?.('focus', () => setContactVersion((v) => v + 1));
+    return unsub;
+  }, [navigation]);
+
   const contact = useMemo(() => {
     if (effectiveContactId) return contactManager.getContact(effectiveContactId);
     try {
@@ -802,7 +818,13 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
       /* ignore */
     }
     return null;
-  }, [effectiveContactId, effectiveThreadId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveContactId, effectiveThreadId, contactVersion]);
+
+  const identityChanged = contact?.verificationState === 'CHANGED_IDENTITY';
+  const openVerify = useCallback(() => {
+    if (contact) navigation?.navigate('Verify', { contactId: contact.id });
+  }, [contact, navigation]);
 
   const effectivePeer = peer ?? {
     alias: contact?.alias ?? 'Peer',
@@ -889,7 +911,9 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
           'Message not sent',
           err instanceof MessageTooLargeError
             ? `Messages are limited to ${MAX_MESSAGE_BYTES} bytes.`
-            : 'Something went wrong. Your message is still in the box.',
+            : err instanceof IdentityChangedError
+              ? 'This contact’s keys changed. Review their safety number first.'
+              : 'Something went wrong. Your message is still in the box.',
         );
         return false;
       }
@@ -962,7 +986,21 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
           ListFooterComponent={<View style={{ height: 110 }} />}
         />
 
+        {identityChanged && (
+          <Pressable
+            onPress={openVerify}
+            style={styles.changedBanner}
+            accessibilityRole="button"
+            accessibilityLabel="Keys changed. Review safety number"
+          >
+            <Text style={[Type.body, { color: Palette.prismMagenta }]}>
+              {`${effectivePeer.alias}'s keys changed. Sending is paused until you review the safety number. Tap to review.`}
+            </Text>
+          </Pressable>
+        )}
+
         <Composer
+          disabled={identityChanged}
           mode={mode}
           ttlMs={ttlMs}
           onModeChange={setMode}
@@ -977,6 +1015,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
         verified={effectivePeer.verified}
         maskLabel={effectiveMaskLabel}
         onBack={handleBack}
+        onVerify={contact ? openVerify : undefined}
       />
 
       {/* Last child, non-interactive, spans the whole viewport. */}
@@ -997,6 +1036,15 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Palette.voidMidnight },
   flex: { flex: 1 },
+  changedBanner: {
+    marginHorizontal: Space.md,
+    marginBottom: Space.sm,
+    padding: Space.md,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: withAlpha(Palette.prismMagenta, 0.5),
+    backgroundColor: withAlpha(Palette.prismMagenta, 0.1),
+  },
   listContent: {
     paddingTop: Space.md,
     paddingBottom: 140,

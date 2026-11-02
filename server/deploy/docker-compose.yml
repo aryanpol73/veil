@@ -1,0 +1,44 @@
+# One-host Veil relay: Caddy terminates TLS (automatic certificates) and
+# forwards WebSocket traffic to the relay on an internal network.
+#
+#   VEIL_DOMAIN=relay.example.org docker compose up -d
+#
+# Clients then use wss://relay.example.org
+services:
+  relay:
+    build: ..
+    restart: unless-stopped
+    environment:
+      VEIL_PORT: "8443"
+    # Not published: only Caddy can reach it.
+    expose:
+      - "8443"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      # The relay logs only boot lines and faults; keep even those short-lived.
+      driver: local
+      options:
+        max-size: "1m"
+        max-file: "1"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [relay]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      VEIL_DOMAIN: ${VEIL_DOMAIN:?set VEIL_DOMAIN to the relay hostname}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

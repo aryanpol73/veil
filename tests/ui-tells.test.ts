@@ -17,7 +17,7 @@ import { PIN_MAX_LENGTH, PIN_MIN_LENGTH, isValidPinLength } from '../client/src/
 const CLIENT = join(__dirname, '..', 'client');
 const POST_SETUP_FILES = [
   join(CLIENT, 'App.tsx'),
-  ...['UnlockScreen.tsx', 'ThreadListScreen.tsx', 'ChatScreen.tsx'].map((f) =>
+  ...['UnlockScreen.tsx', 'ThreadListScreen.tsx', 'ChatScreen.tsx', 'VerifyScreen.tsx'].map((f) =>
     join(CLIENT, 'src', 'screens', f),
   ),
   ...readdirSync(join(CLIENT, 'src', 'components'))

@@ -105,6 +105,16 @@ export class MessageTooLargeError extends Error {
   }
 }
 
+/**
+ * Thrown when sending to a contact whose keys changed and the user has not
+ * reviewed the change yet (audit A-11, feature F-08 AC 3).
+ */
+export class IdentityChangedError extends Error {
+  constructor() {
+    super('[veil/messaging] contact keys changed; review the safety number before sending');
+  }
+}
+
 export type MessageListener = (msg: StoredMessage) => void;
 
 export const threadIdFor = (contact: Pick<Contact, 'id'>): string => `th_${contact.id}`;
@@ -256,6 +266,12 @@ export class MessageService {
     let contact = params.contact;
     const mask = this.activeMask;
     if (!mask) throw new Error('[veil/messaging] no active identity');
+
+    // Re-read: the caller's copy may predate a key change.
+    const current = contactManager.getContact(contact.id);
+    if ((current ?? contact).verificationState === 'CHANGED_IDENTITY') {
+      throw new IdentityChangedError();
+    }
 
     const bodyBytes = utf8(body).length;
     if (bodyBytes > MAX_MESSAGE_BYTES) throw new MessageTooLargeError(bodyBytes);

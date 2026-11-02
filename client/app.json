@@ -30,7 +30,15 @@
         {
           "useSQLCipher": true
         }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Veil uses the camera only to scan invite and verification QR codes. Nothing is recorded.",
+          "recordAudioAndroid": false
+        }
       ]
-    ]
+    ],
+    "scheme": "veil"
   }
 }

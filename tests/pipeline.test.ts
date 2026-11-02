@@ -49,6 +49,7 @@ import { initAliceSession, ratchetEncryptMessage } from '../client/src/protocol/
 import { sealEnvelope, toWireHeader } from '../client/src/transport/SealedEnvelope';
 import { relayClient } from '../client/src/transport/RelayClient';
 import {
+  IdentityChangedError,
   MAX_MESSAGE_BYTES,
   MessageTooLargeError,
   messageService,
@@ -443,6 +444,23 @@ describe('Veil production pipeline (real classes, real relay, real SQLite)', () 
     const stored = contactManager.getContact(contact.id)!;
     assert.equal(stored.verificationState, 'CHANGED_IDENTITY');
     assert.equal(stored.pairSecret, null, 'the old session is dropped');
+
+    // Sending stays blocked until the user reviews the change...
+    await assert.rejects(
+      messageService.sendMessage({
+        threadId: threadIdFor(stored),
+        contact: stored,
+        body: 'are you still you?',
+        retention: 'persistent',
+        senderFp: aliceMask.fingerprint,
+      }),
+      IdentityChangedError,
+    );
+    assert.equal(allMessages().some((m) => m.body === 'are you still you?'), false);
+
+    // ...and resumes once they have.
+    contactManager.setVerificationState(stored.id, 'VERIFIED');
+    assert.equal(contactManager.getContact(stored.id)!.verificationState, 'VERIFIED');
   });
 
   it('tears down every component on lock (A-10)', async () => {

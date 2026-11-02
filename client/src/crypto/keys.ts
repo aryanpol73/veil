@@ -350,6 +350,32 @@ export function computeFingerprint(signPk: Uint8Array, dhPk: Uint8Array): string
   return (crockford(digest).match(/.{1,4}/g) ?? []).join(' ');
 }
 
+/**
+ * Combined safety number for a pair of identities: 60 digits in 12 groups of
+ * five. Both sides compute the same value (inputs are sorted), and it binds
+ * both parties' identity AND exchange keys, so any substitution changes it.
+ * Users compare it in person or over a trusted call.
+ */
+export function safetyNumber(
+  a: { signPk: Uint8Array; dhPk: Uint8Array },
+  b: { signPk: Uint8Array; dhPk: Uint8Array },
+): string {
+  const blobA = concat(a.signPk, a.dhPk);
+  const blobB = concat(b.signPk, b.dhPk);
+  const [first, second] = toHex(blobA) < toHex(blobB) ? [blobA, blobB] : [blobB, blobA];
+  const digest = blake2b(concat(first, second), {
+    dkLen: 60,
+    key: utf8('veil.safety.v1'),
+  });
+  const groups: string[] = [];
+  for (let i = 0; i < 60; i += 5) {
+    let n = 0;
+    for (let j = 0; j < 5; j++) n = n * 256 + digest[i + j];
+    groups.push(String(n % 100_000).padStart(5, '0'));
+  }
+  return groups.join(' ');
+}
+
 /* -------------------------------------------------------------------------- */
 /* AEAD — XChaCha20-Poly1305                                                  */
 /* -------------------------------------------------------------------------- */

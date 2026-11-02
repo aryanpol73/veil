@@ -343,12 +343,24 @@ function assertCipherActive(conn: SqlConnection): void {
   if (!version) throw new VaultEncryptionUnavailableError();
 }
 
+/**
+ * The Argon2id output is a vault MASTER key and is never used directly.
+ * SQLCipher page encryption and field-level AEAD each get their own subkey,
+ * so the two ciphers never share key material (audit A-13).
+ */
+const cipherKeyOf = (vaultMaster: Uint8Array): Uint8Array =>
+  deriveSubSeed(vaultMaster, 'veil.vault.sqlcipher.v1');
+const fieldKeyOf = (vaultMaster: Uint8Array): Uint8Array =>
+  deriveSubSeed(vaultMaster, 'veil.vault.field.v1');
+
 function applyPragmas(conn: SqlConnection, rawKey?: Uint8Array): void {
   if (rawKey && rawKey.length > 0) {
     if (driver.requiresCipher) {
       assertCipherActive(conn);
       // Raw 256-bit key: skips SQLCipher's own PBKDF2, Argon2id already ran.
-      conn.execute(`PRAGMA key = "x'${toHex(rawKey)}'"`);
+      const cipherKey = cipherKeyOf(rawKey);
+      conn.execute(`PRAGMA key = "x'${toHex(cipherKey)}'"`);
+      wipe(cipherKey);
       conn.execute('PRAGMA cipher_page_size = 4096');
     }
     // Non-cipher drivers (web preview, tests) rely on field-level AEAD only.
@@ -392,7 +404,9 @@ function tryOpen(partition: Partition, rawKey: Uint8Array): SqlConnection | null
     }
 
     const aad = utf8(PARTITION_LABEL[partition]);
-    const pt = aeadDecrypt(rawKey, sealed, aad);
+    const fieldKey = fieldKeyOf(rawKey);
+    const pt = aeadDecrypt(fieldKey, sealed, aad);
+    wipe(fieldKey);
     if (!pt) {
       try {
         conn.close();
@@ -717,6 +731,8 @@ async function writeVaults(
   primaryKey: Uint8Array,
   decoyKey: Uint8Array,
 ): Promise<void> {
+  const primaryField = fieldKeyOf(primaryKey);
+  const decoyField = fieldKeyOf(decoyKey);
 
   const pSeed = input.primarySeed ?? randomBytes(CRYPTO.SEED_BYTES);
   const gSeed = input.ghostSeed ?? randomBytes(CRYPTO.SEED_BYTES);
@@ -728,17 +744,17 @@ async function writeVaults(
 
     // Sealed canary for primary
     const primaryCanary = packSealed(
-      aeadEncrypt(primaryKey, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.primary)),
+      aeadEncrypt(primaryField, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.primary)),
     );
     primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'canary',
       primaryCanary,
     ]);
     const sealedPrimaryFp = packSealed(
-      aeadEncrypt(primaryKey, utf8(input.primaryFingerprint), utf8('mask|0|fp')),
+      aeadEncrypt(primaryField, utf8(input.primaryFingerprint), utf8('mask|0|fp')),
     );
     const sealedPrimaryLabel = packSealed(
-      aeadEncrypt(primaryKey, utf8('Personal'), utf8('mask|0|label')),
+      aeadEncrypt(primaryField, utf8('Personal'), utf8('mask|0|label')),
     );
     primary.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
@@ -746,7 +762,7 @@ async function writeVaults(
     );
     primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'master_seed',
-      packSealed(aeadEncrypt(primaryKey, pSeed, utf8('master_seed'))),
+      packSealed(aeadEncrypt(primaryField, pSeed, utf8('master_seed'))),
     ]);
 
     const decoy = driver.open(FILES.decoy);
@@ -755,17 +771,17 @@ async function writeVaults(
 
     // Sealed canary for decoy
     const decoyCanary = packSealed(
-      aeadEncrypt(decoyKey, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.decoy)),
+      aeadEncrypt(decoyField, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.decoy)),
     );
     decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'canary',
       decoyCanary,
     ]);
     const sealedGhostFp = packSealed(
-      aeadEncrypt(decoyKey, utf8(input.ghostFingerprint), utf8('mask|1|fp')),
+      aeadEncrypt(decoyField, utf8(input.ghostFingerprint), utf8('mask|1|fp')),
     );
     const sealedGhostLabel = packSealed(
-      aeadEncrypt(decoyKey, utf8('Personal'), utf8('mask|1|label')),
+      aeadEncrypt(decoyField, utf8('Personal'), utf8('mask|1|label')),
     );
     decoy.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
@@ -773,7 +789,7 @@ async function writeVaults(
     );
     decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'master_seed',
-      packSealed(aeadEncrypt(decoyKey, gSeed, utf8('master_seed'))),
+      packSealed(aeadEncrypt(decoyField, gSeed, utf8('master_seed'))),
     ]);
 
     // No seeded history. Content dated before the app's install time (which
@@ -786,7 +802,7 @@ async function writeVaults(
     primary.close();
     decoy.close();
   } finally {
-    wipe(primaryKey, decoyKey);
+    wipe(primaryKey, decoyKey, primaryField, decoyField);
   }
 }
 
@@ -1252,10 +1268,10 @@ async function openWithPin(pin: string): Promise<VaultSession | null> {
 
     if (p && !d) {
       opened = { conn: p, partition: 'primary' };
-      activeKey = new Uint8Array(primaryKey);
+      activeKey = fieldKeyOf(primaryKey);
     } else if (d && !p) {
       opened = { conn: d, partition: 'decoy' };
-      activeKey = new Uint8Array(decoyKey);
+      activeKey = fieldKeyOf(decoyKey);
     } else if (p && d) {
       // Collision / degenerate state (should never occur with distinct salts/labels)
       try { p.close(); } catch {}

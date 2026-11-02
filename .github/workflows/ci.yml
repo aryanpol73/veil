@@ -53,3 +53,19 @@ jobs:
       - name: Dependency audit, client (report only)
         continue-on-error: true
         run: npm audit --prefix client --audit-level=high --omit=dev
+
+  relay-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build relay image
+        run: docker build -t veil-relay:ci server
+      - name: Smoke-test /healthz
+        run: |
+          docker run -d --name relay -p 8443:8443 veil-relay:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8443/healthz; then exit 0; fi
+            sleep 1
+          done
+          docker logs relay
+          exit 1

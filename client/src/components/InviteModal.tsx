@@ -25,6 +25,7 @@ import {
   KeyboardAvoidingView,
 } from 'react-native';
 import { BlurView } from 'expo-blur';
+import * as Clipboard from 'expo-clipboard';
 import * as Haptics from 'expo-haptics';
 import {
   Blur,
@@ -43,6 +44,7 @@ import PrismInput from './PrismInput';
 import CryptoLabel from './CryptoLabel';
 import FingerprintDisplay from './FingerprintDisplay';
 import QrInvite from './QrInvite';
+import QrScanner from './QrScanner';
 import { parseInvite, type ParsedInvite } from '../crypto/keys';
 
 export interface InviteModalProps {
@@ -50,16 +52,30 @@ export interface InviteModalProps {
   inviteUri: string | null;
   onClose: () => void;
   onPairSuccess: (parsedInvite: ParsedInvite) => void;
+  /** An invite that arrived from outside (deep link); opens the pairing tab with it. */
+  initialImport?: string | null;
 }
+
+/** Copied invites are wiped from the clipboard after this long. */
+const CLIPBOARD_CLEAR_MS = 60_000;
 
 export const InviteModal: React.FC<InviteModalProps> = ({
   visible,
   inviteUri,
   onClose,
   onPairSuccess,
+  initialImport,
 }) => {
   const [activeTab, setActiveTab] = useState<'create' | 'import'>('create');
   const [importText, setImportText] = useState('');
+  const [scanning, setScanning] = useState(false);
+
+  useEffect(() => {
+    if (visible && initialImport) {
+      setActiveTab('import');
+      setImportText(initialImport);
+    }
+  }, [visible, initialImport]);
   const [pairing, setPairing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -102,16 +118,20 @@ export const InviteModal: React.FC<InviteModalProps> = ({
   const handleCopyLink = async () => {
     if (!inviteUri) return;
     try {
-      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
-        await navigator.clipboard.writeText(inviteUri);
-      }
+      await Clipboard.setStringAsync(inviteUri);
       if (Platform.OS !== 'web') {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       }
       setCopied(true);
       setTimeout(() => setCopied(false), 2200);
+      // Other apps can read the clipboard; do not leave the invite there.
+      setTimeout(() => {
+        Clipboard.getStringAsync()
+          .then((current) => (current === inviteUri ? Clipboard.setStringAsync('') : undefined))
+          .catch(() => {});
+      }, CLIPBOARD_CLEAR_MS);
     } catch {
-      /* ignore */
+      setError('Could not copy. Use Share instead.');
     }
   };
 
@@ -132,12 +152,10 @@ export const InviteModal: React.FC<InviteModalProps> = ({
 
   const handlePasteFromClipboard = async () => {
     try {
-      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
-        const text = await navigator.clipboard.readText();
-        if (text) {
-          setImportText(text.trim());
-          setError(null);
-        }
+      const text = await Clipboard.getStringAsync();
+      if (text) {
+        setImportText(text.trim());
+        setError(null);
       }
     } catch {
       /* ignore */
@@ -332,16 +350,26 @@ export const InviteModal: React.FC<InviteModalProps> = ({
                   multiline
                   style={{ minHeight: 70 }}
                   rightAction={
-                    Platform.OS === 'web' ? (
-                      <Pressable
-                        onPress={handlePasteFromClipboard}
-                        style={styles.pastePill}
-                      >
-                        <Text style={styles.pastePillText}>PASTE</Text>
-                      </Pressable>
-                    ) : undefined
+                    <Pressable
+                      onPress={handlePasteFromClipboard}
+                      style={styles.pastePill}
+                      accessibilityRole="button"
+                      accessibilityLabel="Paste invite from clipboard"
+                    >
+                      <Text style={styles.pastePillText}>PASTE</Text>
+                    </Pressable>
                   }
                 />
+
+                {Platform.OS !== 'web' && (
+                  <PrismButton
+                    title="SCAN QR CODE"
+                    variant="ghost"
+                    size="md"
+                    onPress={() => setScanning(true)}
+                    style={styles.pairBtn}
+                  />
+                )}
 
                 <PrismButton
                   title={pairing ? 'VERIFYING IDENTITY…' : 'PAIR WITH CONTACT'}
@@ -367,6 +395,18 @@ export const InviteModal: React.FC<InviteModalProps> = ({
           </ScrollView>
         </View>
       </KeyboardAvoidingView>
+
+      <QrScanner
+        visible={scanning}
+        onClose={() => setScanning(false)}
+        onScanned={(data) => {
+          // Ignore other QR codes in view; only a valid Veil invite closes the scanner.
+          if (!parseInvite(data.trim())) return false;
+          setImportText(data.trim());
+          setError(null);
+          return true;
+        }}
+      />
     </Modal>
   );
 };
