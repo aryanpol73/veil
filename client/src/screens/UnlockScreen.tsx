@@ -43,6 +43,11 @@ import {
 } from '../storage/pinPolicy';
 import type { RootNavigationProp } from '../types/navigation';
 
+const formatWait = (ms: number): string => {
+  const s = Math.ceil(ms / 1000);
+  return s < 60 ? `${s}S` : `${Math.ceil(s / 60)}M`;
+};
+
 export interface UnlockScreenProps {
   navigation: RootNavigationProp;
 }
@@ -68,7 +73,11 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
             /* ignore */
           }
         }
-        setError('INCORRECT PIN');
+        setError(
+          res.retryAfterMs > 0
+            ? `INCORRECT PIN · TRY AGAIN IN ${formatWait(res.retryAfterMs)}`
+            : 'INCORRECT PIN',
+        );
         setPin('');
         return;
       }

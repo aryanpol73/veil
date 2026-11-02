@@ -393,6 +393,36 @@ describe('Veil production pipeline (real classes, real relay, real SQLite)', () 
     assert.ok(sent.delivered_at);
   });
 
+  it('queues messages while the relay is down and sends them on reconnect (outbox)', async () => {
+    await endSession();
+    await openAs(ALICE_PIN);
+    const port = server.port;
+    await server.close();
+    await waitFor(() => relayClient.currentStatus === 'disconnected', 'client notices relay is gone');
+
+    const queued = await messageService.sendMessage({
+      threadId: aliceThreadOnAlice,
+      contact: contactFor(bob.fingerprint)!,
+      body: 'written offline',
+      retention: 'persistent',
+      senderFp: alice.fingerprint,
+    });
+    assert.equal(queued.delivered_at, null, 'not delivered while the relay is down');
+    const outboxRows = () => getDb().execute('SELECT * FROM outbox WHERE next_attempt_at <= ?', [Number.MAX_SAFE_INTEGER]).rows;
+    assert.equal(outboxRows().length, 1, 'queued in the outbox');
+
+    server = await startRelayServer(port, { busType: 'memory' });
+    await waitFor(() => outboxRows().length === 0, 'outbox drains after reconnect', 20_000);
+    const row = getDb()
+      .execute<{ delivered_at: number | null }>('SELECT delivered_at FROM messages WHERE id = ?', [queued.id])
+      .rows[0];
+    assert.ok(row.delivered_at, 'marked delivered once the relay accepted it');
+    await endSession();
+
+    await openAs(BOB_PIN);
+    await waitFor(() => allMessages().find((m) => m.body === 'written offline'), 'Bob receives it');
+  });
+
   it('flags a re-imported identity with a new exchange key as CHANGED_IDENTITY (A-11)', async () => {
     await endSession();
     const aliceMask = await openAs(ALICE_PIN);

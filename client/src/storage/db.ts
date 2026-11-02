@@ -52,6 +52,7 @@ import {
 } from '../crypto/keys';
 import { defaultDriver } from './sqliteDriver';
 import { PIN_MAX_LENGTH, PIN_MIN_LENGTH, isValidPinLength } from './pinPolicy';
+import { readLimiter, recordAttempt, retryAfter } from './attemptLimiter';
 import type { RetentionMode } from '../theme/obsidianPrism';
 
 /* -------------------------------------------------------------------------- */
@@ -181,6 +182,19 @@ CREATE TABLE IF NOT EXISTS contacts (
   verification_state TEXT,
   pair_secret  TEXT,
   rendezvous   TEXT
+);
+
+-- Outgoing messages not yet accepted by a relay. "inner" is the sealed
+-- (vault-key AEAD) ratchet output; the relay envelope is rebuilt on every
+-- attempt so a late retry targets the recipient's current inbox.
+CREATE TABLE IF NOT EXISTS outbox (
+  id               TEXT PRIMARY KEY NOT NULL,
+  thread_id        TEXT NOT NULL,
+  contact_id       TEXT NOT NULL,
+  inner            TEXT NOT NULL,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at  INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL
 );
 
 -- Invites this vault issued. rz and auth_seed are sealed with AEAD. A row
@@ -762,7 +776,10 @@ async function writeVaults(
       packSealed(aeadEncrypt(decoyKey, gSeed, utf8('master_seed'))),
     ]);
 
-    seedDecoy(decoy, decoyKey);
+    // No seeded history. Content dated before the app's install time (which
+    // the OS shows) would itself be a tell, and a fixed seed is identical on
+    // every install (audit A-07). Both vaults start empty and identical; the
+    // decoy accrues real history the same way the primary does.
 
     // Equalize on-disk footprint, then close both together.
     padToward(primary, decoy);
@@ -1018,6 +1035,76 @@ export function updateContactPairSecret(id: string, pairSecret: Uint8Array): voi
 }
 
 /* -------------------------------------------------------------------------- */
+/* Outbox                                                                     */
+/* -------------------------------------------------------------------------- */
+
+export interface OutboxItem {
+  id: string;
+  threadId: string;
+  contactId: string;
+  inner: Uint8Array;
+  attempts: number;
+  nextAttemptAt: number;
+  createdAt: number;
+}
+
+export function enqueueOutbox(item: { id: string; threadId: string; contactId: string; inner: Uint8Array }): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  const now = Date.now();
+  getDb().execute(
+    `INSERT INTO outbox (id, thread_id, contact_id, inner, attempts, next_attempt_at, created_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [
+      item.id,
+      item.threadId,
+      item.contactId,
+      sealOptional(active.vaultKey, item.inner, `outbox|${item.id}|inner`),
+      0,
+      now,
+      now,
+    ],
+  );
+}
+
+/** Items whose next attempt is due, oldest first. */
+export function listDueOutbox(now: number = Date.now()): OutboxItem[] {
+  if (!active) return [];
+  const key = active.vaultKey;
+  const rows =
+    getDb().execute<any>('SELECT * FROM outbox WHERE next_attempt_at <= ? ORDER BY created_at ASC', [now])
+      .rows ?? [];
+  const out: OutboxItem[] = [];
+  for (const r of rows) {
+    const inner = openOptional(key, r.inner, `outbox|${r.id}|inner`);
+    if (!inner) continue;
+    out.push({
+      id: r.id,
+      threadId: r.thread_id,
+      contactId: r.contact_id,
+      inner,
+      attempts: r.attempts,
+      nextAttemptAt: r.next_attempt_at,
+      createdAt: r.created_at,
+    });
+  }
+  return out;
+}
+
+export function rescheduleOutbox(id: string, attempts: number, nextAttemptAt: number): void {
+  if (!active) return;
+  getDb().execute('UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE id = ?', [
+    attempts,
+    nextAttemptAt,
+    id,
+  ]);
+}
+
+export function deleteOutbox(id: string): void {
+  if (!active) return;
+  getDb().execute('DELETE FROM outbox WHERE id = ?', [id]);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Invites issued by this vault                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -1097,88 +1184,6 @@ export function pruneInvites(now: number = Date.now()): void {
 }
 
 /**
- * Seeds the decoy with neutral, boring, plausibly-aged content: a handful of
- * contacts and logistics chatter spread over the past few weeks. An empty
- * decoy is worse than no decoy — it reads as freshly manufactured.
- */
-function seedDecoy(conn: SqlConnection, vaultKey: Uint8Array): void {
-  const now = Date.now();
-  const DAY = 86_400_000;
-
-  const people: Array<[string, string]> = [
-    ['Dana R.', 'K7QP 4M2X 9WVE 3TNA 6HJD'],
-    ['Marco', 'B2XR 8T5K 1QMW 7NPV 4ZCE'],
-    ['Cycling Group', 'V9WM 3KQT 6XPB 2NER 8HAD'],
-    ['Aunt Lily', 'T4NC 7VPQ 2MKX 9WRB 5ZEH'],
-  ];
-
-  const chatter: Array<[number, 'in' | 'out', string, number]> = [
-    [0, 'in', 'are we still on for saturday?', 19 * DAY],
-    [0, 'out', 'yep — 10am at the usual place', 19 * DAY - 4e5],
-    [0, 'in', 'perfect, ill bring the thermos', 19 * DAY - 9e5],
-    [1, 'out', 'did you ever get that invoice sorted?', 12 * DAY],
-    [1, 'in', 'finally, yes. took three emails', 12 * DAY - 3e6],
-    [2, 'in', 'route change this week, meeting at the north gate', 6 * DAY],
-    [2, 'out', 'noted. weather looks fine', 6 * DAY - 6e5],
-    [3, 'in', 'the photos came out lovely, thank you', 2 * DAY],
-    [3, 'out', 'ill print a few and post them over', 2 * DAY - 1.2e6],
-    [0, 'in', 'running about 10 min late, sorry!', 4 * 3.6e6],
-  ];
-
-  conn.transaction(() => {
-    people.forEach(([alias, fp], i) => {
-      const contactId = `dc_${i}`;
-      const threadId = `dt_${i}`;
-      saveContactRow(
-        {
-          id: contactId,
-          maskIndex: 1,
-          alias,
-          signPk: randomBytes(32),
-          dhPk: randomBytes(32),
-          fingerprint: fp,
-          verifiedAt: i < 2 ? now - 20 * DAY : null,
-          createdAt: now - (30 - i * 4) * DAY,
-        },
-        vaultKey,
-        conn,
-      );
-      conn.execute(
-        `INSERT OR REPLACE INTO threads
-         (id, contact_id, default_retention, last_activity_at, unread_count)
-         VALUES (?,?,?,?,?)`,
-        [threadId, contactId, 'persistent', now - DAY, 0],
-      );
-    });
-
-    chatter.forEach(([threadIdx, direction, body, ago], i) => {
-      const msgId = `dm_${i}`;
-      const sealedBody = packSealed(
-        aeadEncrypt(vaultKey, utf8(body), utf8(`msg|${msgId}`)),
-      );
-      conn.execute(
-        `INSERT OR REPLACE INTO messages
-         (id, thread_id, direction, retention, body, created_at, delivered_at, read_at, counter)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
-        [
-          msgId,
-          `dt_${threadIdx}`,
-          direction,
-          'persistent',
-          sealedBody,
-          now - ago,
-          now - ago + 1500,
-          now - ago + 60_000,
-          i,
-        ],
-      );
-    });
-
-    conn.execute('UPDATE threads SET unread_count = 1 WHERE id = ?', ['dt_0']);
-  });
-}
-
-/**
  * Inflates the smaller of the two vaults with incompressible random ballast so
  * their page counts converge. Ballast is indistinguishable from real content.
  */
@@ -1203,7 +1208,10 @@ function padToward(a: SqlConnection, b: SqlConnection): void {
 /* Unlock                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export type UnlockResult = { ok: true; session: VaultSession } | { ok: false };
+export type UnlockResult =
+  | { ok: true; session: VaultSession }
+  /** `retryAfterMs` > 0 means the attempt limiter is holding further tries. */
+  | { ok: false; retryAfterMs: number };
 
 /**
  * The single entry point for PIN entry.
@@ -1216,6 +1224,17 @@ export type UnlockResult = { ok: true; session: VaultSession } | { ok: false };
 export async function unlockWithPin(pin: string): Promise<UnlockResult> {
   await lockVault();
 
+  // One device-wide limiter, outside both vaults (see attemptLimiter.ts).
+  const limiter = await readLimiter();
+  const wait = retryAfter(limiter);
+  if (wait > 0) return { ok: false, retryAfterMs: wait };
+
+  const session = await openWithPin(pin);
+  const next = await recordAttempt(limiter, session !== null);
+  return session ? { ok: true, session } : { ok: false, retryAfterMs: retryAfter(next) };
+}
+
+async function openWithPin(pin: string): Promise<VaultSession | null> {
   const salt = await loadOrCreateDeviceSalt();
 
   // Fixed, unconditional work: derive both candidates every single time.
@@ -1241,9 +1260,9 @@ export async function unlockWithPin(pin: string): Promise<UnlockResult> {
       // Collision / degenerate state (should never occur with distinct salts/labels)
       try { p.close(); } catch {}
       try { d.close(); } catch {}
-      return { ok: false };
+      return null;
     }
-    if (!opened || !activeKey) return { ok: false };
+    if (!opened || !activeKey) return null;
 
     migrate(opened.conn);
 
@@ -1258,7 +1277,7 @@ export async function unlockWithPin(pin: string): Promise<UnlockResult> {
     sweepExpired();
     startSweepTimer();
 
-    return { ok: true, session: { db: active.db, sessionId: active.sessionId } };
+    return { db: active.db, sessionId: active.sessionId };
   } finally {
     wipe(primaryKey, decoyKey);
   }

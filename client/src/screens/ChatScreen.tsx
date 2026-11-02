@@ -789,7 +789,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   onBack,
   onTransmit,
 }) => {
-  const effectiveThreadId = route?.params?.threadId ?? threadId ?? 'dt_0';
+  const effectiveThreadId = route?.params?.threadId ?? threadId ?? '';
   const effectiveContactId = route?.params?.contactId;
 
   const contact = useMemo(() => {

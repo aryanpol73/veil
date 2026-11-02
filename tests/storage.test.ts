@@ -94,9 +94,9 @@ describe('Veil Dual-Partition Vault & Storage', () => {
     assert.ok(seed);
     assert.equal(seed.length, 32);
 
-    // Verify decoy has seeded conversations
-    const messages = listMessages('dt_0');
-    assert(messages.length > 0);
+    // The decoy starts exactly like the primary: empty, no fixed seed (A-07).
+    assert.equal(getDb().execute('SELECT * FROM threads').rows.length, 0);
+    assert.equal(getDb().execute('SELECT * FROM contacts').rows.length, 0);
   });
 
   it('rejects invalid PIN and leaves vault securely locked', async () => {

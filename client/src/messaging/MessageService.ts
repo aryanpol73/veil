@@ -33,10 +33,14 @@
 
 import { createInvite as buildInvite, fromB64, randomBytes, wipe, type MaskIdentity } from '../crypto/keys';
 import {
+  deleteOutbox,
+  enqueueOutbox,
   insertMessage,
   isVaultOpen,
+  listDueOutbox,
   listLiveInvites,
   markDelivered,
+  rescheduleOutbox,
   markInviteConsumed,
   newLocalId,
   pruneInvites,
@@ -63,7 +67,14 @@ import {
   ratchetDecryptMessage,
   type RatchetEncryptedPayload,
 } from '../protocol/ratchet';
-import { openEnvelope, sealEnvelope, toWireHeader, type InnerEnvelope } from '../transport/SealedEnvelope';
+import {
+  deserializeInner,
+  openEnvelope,
+  sealEnvelope,
+  serializeInner,
+  toWireHeader,
+  type InnerEnvelope,
+} from '../transport/SealedEnvelope';
 import { relayClient, RelayClient } from '../transport/RelayClient';
 import type { Contact, RetentionMode } from '../types/models';
 import { ratchetManager, RatchetManager } from './RatchetManager';
@@ -82,6 +93,11 @@ const RETENTION_MODES: RetentionMode[] = ['persistent', 'timed', 'viewOnce'];
 
 /** Subscriptions are refreshed this often so pair-inbox epochs roll over. */
 const REFRESH_MS = 15 * 60_000;
+
+/** Outbox polling and retry backoff. */
+const OUTBOX_POLL_MS = 15_000;
+const OUTBOX_RETRY_BASE_MS = 2_000;
+const OUTBOX_RETRY_MAX_MS = 5 * 60_000;
 
 export class MessageTooLargeError extends Error {
   constructor(public readonly bytes: number) {
@@ -106,6 +122,9 @@ export class MessageService {
   private subscribed = new Map<string, () => void>();
   private routes = new Map<string, Route>();
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private outboxTimer: ReturnType<typeof setInterval> | null = null;
+  private statusUnsub: (() => void) | null = null;
+  private flushChain: Promise<void> = Promise.resolve();
   private activeMask: MaskIdentity | null = null;
 
   constructor(relay: RelayClient = relayClient, ratchets: RatchetManager = ratchetManager) {
@@ -120,12 +139,23 @@ export class MessageService {
     this.refreshSubscriptions();
 
     if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.outboxTimer) clearInterval(this.outboxTimer);
     this.refreshTimer = null;
-    if (mask) {
-      const timer = setInterval(() => this.refreshSubscriptions(), REFRESH_MS);
-      (timer as { unref?: () => void }).unref?.();
-      this.refreshTimer = timer;
-    }
+    this.outboxTimer = null;
+    this.statusUnsub?.();
+    this.statusUnsub = null;
+    if (!mask) return;
+
+    const unref = (t: ReturnType<typeof setInterval>) => {
+      (t as { unref?: () => void }).unref?.();
+      return t;
+    };
+    this.refreshTimer = unref(setInterval(() => this.refreshSubscriptions(), REFRESH_MS));
+    this.outboxTimer = unref(setInterval(() => void this.flushOutbox(), OUTBOX_POLL_MS));
+    // Anything queued while offline goes out as soon as the relay is back.
+    this.statusUnsub = this.relay.onStatusChange((status) => {
+      if (status === 'connected') void this.flushOutbox(true);
+    });
   }
 
   public onMessage(listener: MessageListener): () => void {
@@ -260,14 +290,6 @@ export class MessageService {
     );
     const header = toWireHeader(encrypted.header);
 
-    const viaRendezvous = !replied && !!contact.rendezvous;
-    const inbox = viaRendezvous
-      ? rendezvousInboxId(contact.rendezvous!)
-      : pairInboxId(contact.pairSecret, contact.signPk);
-    const headerKey = viaRendezvous
-      ? rendezvousHeaderKey(contact.rendezvous!)
-      : pairHeaderKey(contact.pairSecret, contact.signPk);
-
     const inner: InnerEnvelope = {
       header,
       nonce: encrypted.nonce,
@@ -278,19 +300,85 @@ export class MessageService {
       inner.intro = sealIntro(intro, introKey, header.dhPk);
       wipe(introKey);
     }
-    const sealed = sealEnvelope(headerKey, inbox, inner);
+    // Fail now, before storing, if the envelope cannot be built.
+    const route = this.routeFor(threadId, contact)!;
+    sealEnvelope(route.headerKey, route.inbox, inner);
 
-    const stored = insertMessage({ id: msgId, threadId, direction: 'out', retention, body, ttlMs });
+    // The local copy and its outbox entry commit together, so a crash can
+    // neither lose a queued message nor leave a phantom "sent" one.
+    let stored!: StoredMessage;
+    withTransaction(() => {
+      stored = insertMessage({ id: msgId, threadId, direction: 'out', retention, body, ttlMs });
+      enqueueOutbox({ id: msgId, threadId, contactId: contact.id, inner: serializeInner(inner) });
+    });
     this.notifyListeners(stored);
 
-    try {
-      await this.relay.sendEnvelope(inbox, sealed);
-      markDelivered(msgId);
-      stored.delivered_at = Date.now();
-    } catch {
-      // Not accepted by the relay; the bubble shows it as undelivered.
-    }
+    const delivered = await this.flushOutbox();
+    if (delivered.has(msgId)) stored.delivered_at = Date.now();
     return stored;
+  }
+
+  /** Current inbox and header key for mail to `contact`, or null without a session. */
+  private routeFor(
+    threadId: string,
+    contact: Contact,
+  ): { inbox: string; headerKey: Uint8Array } | null {
+    if (!contact.pairSecret) return null;
+    // Until the peer has replied, write through the invite's rendezvous inbox.
+    if (contact.rendezvous && !this.ratchets.hasReceived(threadId)) {
+      return {
+        inbox: rendezvousInboxId(contact.rendezvous),
+        headerKey: rendezvousHeaderKey(contact.rendezvous),
+      };
+    }
+    return {
+      inbox: pairInboxId(contact.pairSecret, contact.signPk),
+      headerKey: pairHeaderKey(contact.pairSecret, contact.signPk),
+    };
+  }
+
+  /**
+   * Sends every due outbox item. Runs one at a time (calls are chained), and
+   * resolves with the IDs the relay accepted during this run. `force` ignores
+   * backoff, e.g. right after reconnecting.
+   */
+  public flushOutbox(force = false): Promise<Set<string>> {
+    const run = this.flushChain.then(() => this.flushOnce(force));
+    this.flushChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async flushOnce(force: boolean): Promise<Set<string>> {
+    const delivered = new Set<string>();
+    if (!this.activeMask || !isVaultOpen()) return delivered;
+
+    for (const item of listDueOutbox(force ? Number.MAX_SAFE_INTEGER : Date.now())) {
+      if (!this.activeMask || !isVaultOpen()) break;
+      const contact = contactManager.getContact(item.contactId);
+      const inner = deserializeInner(item.inner);
+      const route = contact ? this.routeFor(item.threadId, contact) : null;
+      if (!contact || !inner || !route) {
+        deleteOutbox(item.id); // the conversation is gone; nothing to retry
+        continue;
+      }
+      try {
+        // Sealed afresh per attempt: a late retry targets the current epoch.
+        await this.relay.sendEnvelope(route.inbox, sealEnvelope(route.headerKey, route.inbox, inner));
+        withTransaction(() => {
+          deleteOutbox(item.id);
+          markDelivered(item.id);
+        });
+        delivered.add(item.id);
+      } catch {
+        const attempts = item.attempts + 1;
+        const backoff = Math.min(OUTBOX_RETRY_MAX_MS, OUTBOX_RETRY_BASE_MS * 2 ** (attempts - 1));
+        rescheduleOutbox(item.id, attempts, Date.now() + backoff);
+      }
+    }
+    return delivered;
   }
 
   /**

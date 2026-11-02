@@ -96,6 +96,7 @@ interface MemoryDbState {
   ratchets: Map<string, any>;
   messages: Map<string, any>;
   invites: Map<string, any>;
+  outbox: Map<string, any>;
   ballast: any[];
   pageCount: number;
 }
@@ -113,6 +114,7 @@ function getOrCreateMemoryDb(name: string): MemoryDbState {
       ratchets: new Map(),
       messages: new Map(),
       invites: new Map(),
+      outbox: new Map(),
       ballast: [],
       pageCount: 16,
     };
@@ -233,6 +235,37 @@ export const memoryDriver: SqlDriver = {
           const c = mem.contacts.get(params[1]);
           if (c) c.pair_secret = params[0];
           return { rows: [], rowsAffected: c ? 1 : 0 };
+        }
+
+        // Outbox
+        if (/INSERT\s+INTO\s+outbox/i.test(trimmed)) {
+          mem.outbox.set(params[0], {
+            id: params[0],
+            thread_id: params[1],
+            contact_id: params[2],
+            inner: params[3],
+            attempts: params[4],
+            next_attempt_at: params[5],
+            created_at: params[6],
+          });
+          return { rows: [], rowsAffected: 1 };
+        }
+        if (/SELECT\s+\*\s+FROM\s+outbox\s+WHERE\s+next_attempt_at\s*<=\s*\?/i.test(trimmed)) {
+          const due = [...mem.outbox.values()]
+            .filter((o) => o.next_attempt_at <= params[0])
+            .sort((a, b) => a.created_at - b.created_at);
+          return { rows: due as any, rowsAffected: 0 };
+        }
+        if (/UPDATE\s+outbox\s+SET\s+attempts\s*=\s*\?,\s*next_attempt_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const o = mem.outbox.get(params[2]);
+          if (o) {
+            o.attempts = params[0];
+            o.next_attempt_at = params[1];
+          }
+          return { rows: [], rowsAffected: o ? 1 : 0 };
+        }
+        if (/DELETE\s+FROM\s+outbox\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          return { rows: [], rowsAffected: mem.outbox.delete(params[0]) ? 1 : 0 };
         }
 
         // Invites

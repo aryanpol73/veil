@@ -50,6 +50,32 @@ export interface InnerEnvelope {
 
 const aadFor = (inbox: string) => encoder.encode(`veil.env.v2|${inbox}`);
 
+/** Serialises an inner envelope for local storage (the outbox). */
+export function serializeInner(inner: InnerEnvelope): Uint8Array {
+  return encoder.encode(
+    JSON.stringify({
+      h: inner.header,
+      ...(inner.intro ? { i: inner.intro } : {}),
+      n: toB64(inner.nonce),
+      c: toB64(inner.ciphertext),
+    }),
+  );
+}
+
+export function deserializeInner(bytes: Uint8Array): InnerEnvelope | null {
+  try {
+    const obj = JSON.parse(decoder.decode(bytes));
+    return {
+      header: obj.h,
+      intro: obj.i,
+      nonce: fromB64(obj.n),
+      ciphertext: fromB64(obj.c),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Strips anything the wire must not carry from a ratchet header. */
 export const toWireHeader = (h: RatchetHeader): WireHeader => ({
   dhPk: h.dhPk,
