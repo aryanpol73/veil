@@ -20,16 +20,15 @@ try {
  * Conforms strictly to the SqlDriver / SqlConnection / SqlResult interfaces in db.ts.
  */
 export const expoSqliteDriver: SqlDriver = {
+  // SQLCipher is a build-time switch (app.json expo-sqlite plugin
+  // `useSQLCipher: true`, then prebuild); there is no runtime open option.
+  // db.ts verifies it with `PRAGMA cipher_version` before keying.
+  requiresCipher: true,
   open(name: string): SqlConnection {
     if (!isNative || !SQLite) {
       return memoryDriver.open(name);
     }
-    let db: any;
-    try {
-      db = SQLite.openDatabaseSync(name, { useSQLCipher: true });
-    } catch {
-      db = SQLite.openDatabaseSync(name);
-    }
+    const db: any = SQLite.openDatabaseSync(name);
 
     return {
       execute<T = any>(sql: string, params: any[] = []): SqlResult<T> {
@@ -195,6 +194,7 @@ export const memoryDriver: SqlDriver = {
             fp_tag: hasFpTag ? params[6] : undefined,
             verified_at: hasFpTag ? params[7] : params[6],
             created_at: hasFpTag ? params[8] : params[7],
+            verification_state: params[9] ?? null,
           });
           return { rows: [], rowsAffected: 1 };
         }
@@ -216,14 +216,20 @@ export const memoryDriver: SqlDriver = {
           return { rows: all as any, rowsAffected: 0 };
         }
 
-        if (/UPDATE\s+contacts\s+SET\s+verified_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
-          const c = mem.contacts.get(params[1]);
-          if (c) c.verified_at = params[0];
+        if (/UPDATE\s+contacts\s+SET\s+verified_at\s*=\s*\?,\s*verification_state\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const c = mem.contacts.get(params[2]);
+          if (c) {
+            c.verified_at = params[0];
+            c.verification_state = params[1];
+          }
           return { rows: [], rowsAffected: c ? 1 : 0 };
         }
 
         // 7. threads table
-        if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+threads/i.test(trimmed)) {
+        if (/INSERT\s+(OR\s+(REPLACE|IGNORE)\s+)?INTO\s+threads/i.test(trimmed)) {
+          if (/IGNORE/i.test(trimmed) && mem.threads.has(params[0])) {
+            return { rows: [], rowsAffected: 0 };
+          }
           mem.threads.set(params[0], {
             id: params[0],
             contact_id: params[1],
@@ -265,6 +271,11 @@ export const memoryDriver: SqlDriver = {
         }
 
         // 8. ratchets table
+        if (/DELETE\s+FROM\s+ratchets\s+WHERE\s+thread_id\s*=\s*\?/i.test(trimmed)) {
+          const existed = mem.ratchets.delete(params[0]);
+          return { rows: [], rowsAffected: existed ? 1 : 0 };
+        }
+
         if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+ratchets/i.test(trimmed)) {
           mem.ratchets.set(params[0], {
             thread_id: params[0],

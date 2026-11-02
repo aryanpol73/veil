@@ -4,9 +4,9 @@
   "main": "index.js",
   "dependencies": {
     "@expo/metro-runtime": "~57.0.15",
-    "@noble/ciphers": "^2.4.0",
-    "@noble/curves": "^2.4.0",
-    "@noble/hashes": "^2.4.0",
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
     "@react-navigation/native": "^7.3.18",
     "@react-navigation/stack": "^7.10.24",
     "expo": "~57.0.20",
@@ -25,7 +25,8 @@
     "react-native-reanimated": "4.5.1",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-svg": "15.15.4",
-    "react-native-web": "^0.21.2"
+    "react-native-web": "^0.21.2",
+    "toqr": "0.1.1"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

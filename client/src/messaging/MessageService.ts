@@ -5,51 +5,83 @@
  *  Orchestrates the end-to-end messaging pipeline:
  *
  *    Outbound:
- *      Composer -> MessageService -> Local Storage (Vault / RamVault)
- *      -> RatchetManager (AEAD encrypt) -> EnvelopeCodec (4096-byte pad)
- *      -> RelayClient (SEND) -> Relay ACK -> markDelivered()
+ *      Composer -> MessageService -> RatchetManager (AEAD encrypt)
+ *      -> EnvelopeCodec (4096-byte pad) -> Local Storage (Vault / RamVault)
+ *      -> RelayClient (SEND) -> Relay ACCEPTED -> markDelivered()
  *
  *    Inbound:
- *      Relay (DELIVER) -> RelayClient (instant ACK) -> EnvelopeCodec (unpad)
- *      -> RatchetManager (AEAD decrypt) -> Local Storage (Vault / RamVault)
- *      -> UI Notification
+ *      Relay (DELIVER) -> RelayClient -> EnvelopeCodec (unpad)
+ *      -> RatchetManager (AEAD decrypt) -> Local Storage, in ONE transaction
+ *      -> return true -> RelayClient ACKs (relay deletes its copy)
  *
  *  Ensures:
  *   - No UI component directly performs cryptography.
  *   - No UI component manages WebSocket protocol frames.
  *   - No relay module sees or decrypts message content.
+ *   - The relay copy is only deleted after the message is durably stored.
+ *   - A session is only started from a first message carrying a valid,
+ *     signed initiator introduction (see protocol/intro.ts).
  * ============================================================================
  */
 
 import {
   blindedInboxId,
-  inboxWindow,
+  inboxCatchUpWindow,
   fromB64,
+  wipe,
   type MaskIdentity,
 } from '../crypto/keys';
 import {
   insertMessage,
+  isVaultOpen,
   markDelivered,
+  newLocalId,
+  withTransaction,
   type StoredMessage,
 } from '../storage/db';
 import { contactManager } from '../protocol/contacts/ContactManager';
+import { createIntro, decodeInner, encodeInner, verifyIntro } from '../protocol/intro';
+import {
+  initBobSession,
+  ratchetDecryptMessage,
+  type RatchetEncryptedPayload,
+} from '../protocol/ratchet';
 import { EnvelopeCodec } from '../transport/EnvelopeCodec';
 import { relayClient, RelayClient } from '../transport/RelayClient';
 import type { Contact, RetentionMode, WireEnvelope } from '../types/models';
 import { ratchetManager, RatchetManager } from './RatchetManager';
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 const utf8 = (s: string) => encoder.encode(s);
-const fromUtf8 = (b: Uint8Array) => decoder.decode(b);
+
+/**
+ * Largest message body accepted from the composer, in UTF-8 bytes. Leaves
+ * headroom inside the 4096-byte envelope for the header, intro and base64
+ * expansion, so an accepted message can always be encoded.
+ */
+export const MAX_MESSAGE_BYTES = 2000;
+
+const RETENTION_MODES: RetentionMode[] = ['persistent', 'timed', 'viewOnce'];
+const HOUR_MS = 3_600_000;
+
+export class MessageTooLargeError extends Error {
+  constructor(public readonly bytes: number) {
+    super(`[veil/messaging] message is ${bytes} bytes; limit is ${MAX_MESSAGE_BYTES}`);
+  }
+}
 
 export type MessageListener = (msg: StoredMessage) => void;
+
+export const threadIdFor = (contact: Pick<Contact, 'id'>): string => `th_${contact.id}`;
+
+const conversationIdFor = (a: string, b: string): string => [a, b].sort().join(':');
 
 export class MessageService {
   private relay: RelayClient;
   private ratchets: RatchetManager;
   private messageListeners = new Set<MessageListener>();
-  private unsubscribeInboxes: Array<() => void> = [];
+  private subscribed = new Map<string, () => void>();
+  private epochTimer: ReturnType<typeof setTimeout> | null = null;
   private activeMask: MaskIdentity | null = null;
 
   constructor(relay: RelayClient = relayClient, ratchets: RatchetManager = ratchetManager) {
@@ -57,9 +89,11 @@ export class MessageService {
     this.ratchets = ratchets;
   }
 
+  /** Binds the service to an unlocked identity, or detaches it on lock (null). */
   public setActiveMask(mask: MaskIdentity | null): void {
     this.activeMask = mask;
     this.refreshSubscriptions();
+    this.scheduleEpochRefresh();
   }
 
   public onMessage(listener: MessageListener): () => void {
@@ -78,33 +112,51 @@ export class MessageService {
   }
 
   /**
-   * Refreshes relay subscriptions across the current hourly epoch window (hour-1, hour, hour+1).
+   * Brings relay subscriptions in line with the current catch-up window
+   * (last 24 epochs, current, next). Only the difference is (un)subscribed.
    */
   public refreshSubscriptions(): void {
-    // Unsubscribe previous inboxes
-    for (const unsub of this.unsubscribeInboxes) {
+    const wanted = new Set(this.activeMask ? inboxCatchUpWindow(this.activeMask.dhPk) : []);
+
+    for (const [inbox, unsub] of this.subscribed) {
+      if (wanted.has(inbox)) continue;
       try {
         unsub();
       } catch {
         /* ignore */
       }
+      this.subscribed.delete(inbox);
     }
-    this.unsubscribeInboxes = [];
 
+    const mask = this.activeMask;
+    if (!mask) return;
+    for (const inbox of wanted) {
+      if (this.subscribed.has(inbox)) continue;
+      const unsub = this.relay.subscribe(inbox, mask, (envelope, rawId) =>
+        this.handleInboundEnvelope(envelope, rawId),
+      );
+      this.subscribed.set(inbox, unsub);
+    }
+  }
+
+  /** Re-runs refreshSubscriptions just after every epoch-hour boundary. */
+  private scheduleEpochRefresh(): void {
+    if (this.epochTimer) clearTimeout(this.epochTimer);
+    this.epochTimer = null;
     if (!this.activeMask) return;
 
-    // Subscribe to current inbox window for our mask's DH key
-    const inboxes = inboxWindow(this.activeMask.dhPk);
-    for (const inbox of inboxes) {
-      const unsub = this.relay.subscribe(inbox, this.activeMask, (envelope, rawId) => {
-        this.handleInboundEnvelope(envelope, rawId);
-      });
-      this.unsubscribeInboxes.push(unsub);
-    }
+    const delay = HOUR_MS - (Date.now() % HOUR_MS) + 1_000;
+    const timer = setTimeout(() => {
+      this.refreshSubscriptions();
+      this.scheduleEpochRefresh();
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.epochTimer = timer;
   }
 
   /**
    * Sends an outbound message through the complete cryptographic pipeline.
+   * Throws MessageTooLargeError before anything is stored or sent.
    */
   public async sendMessage(params: {
     threadId: string;
@@ -116,41 +168,35 @@ export class MessageService {
     msgId?: string;
   }): Promise<StoredMessage> {
     const { threadId, contact, body, retention, ttlMs, senderFp } = params;
-    const msgId =
-      params.msgId ??
-      `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const mask = this.activeMask;
+    if (!mask) throw new Error('[veil/messaging] no active identity');
 
-    // 1. Store locally in vault (persistent/timed) or RamVault (viewOnce)
-    const stored = insertMessage({
-      id: msgId,
-      threadId,
-      direction: 'out',
-      retention,
-      body,
-      ttlMs,
-    });
+    const bodyBytes = utf8(body).length;
+    if (bodyBytes > MAX_MESSAGE_BYTES) throw new MessageTooLargeError(bodyBytes);
 
-    this.notifyListeners(stored);
+    const msgId = params.msgId ?? newLocalId('m');
 
-    // 2. Derive symmetrical conversation ID for AAD binding
-    const conversationId = [senderFp, contact.fingerprint].sort().join(':');
+    // 1. Until the peer has replied, introduce ourselves inside the ciphertext
+    //    so they can authenticate us and route replies to our inbox.
+    const state = this.ratchets.ensureOutgoingSession(threadId, contact);
+    const intro = this.ratchets.hasReceived(threadId)
+      ? undefined
+      : createIntro(mask, state.localDhPk, contact.signPk, contact.dhPk);
 
-    // 3. Encrypt payload with Double Ratchet
+    // 2. Encrypt with the Double Ratchet, binding the symmetric conversation ID.
     const encrypted = this.ratchets.encrypt(
       threadId,
-      utf8(body),
+      encodeInner({ body, intro }),
       retention,
       senderFp,
       msgId,
       contact,
       ttlMs,
-      conversationId,
+      conversationIdFor(senderFp, contact.fingerprint),
     );
 
-    // 4. Target recipient's blinded inbox address for current epoch
+    // 3. Encode and pad to uniform 4,096 bytes for the recipient's current inbox.
     const targetInbox = blindedInboxId(contact.dhPk);
-
-    // 5. Encode and pad to uniform 4,096 bytes
     const paddedEnvelope = EnvelopeCodec.encode({
       inbox: targetInbox,
       header: encrypted.header,
@@ -159,103 +205,167 @@ export class MessageService {
       id: msgId,
     });
 
-    // 6. Dispatch across blind relay and wait for acceptance
+    // 4. Store locally only once the message is known to be encodable.
+    const stored = insertMessage({
+      id: msgId,
+      threadId,
+      direction: 'out',
+      retention,
+      body,
+      ttlMs,
+    });
+    this.notifyListeners(stored);
+
+    // 5. Dispatch across the blind relay and wait for acceptance.
     try {
       await this.relay.sendEnvelope(targetInbox, paddedEnvelope);
       markDelivered(msgId);
       stored.delivered_at = Date.now();
     } catch {
-      // Message queued locally; failure indicated on bubble rather than modal alert
+      // Not accepted by the relay; the bubble shows it as undelivered.
     }
 
     return stored;
   }
 
   /**
-   * Processes inbound envelopes delivered by the relay.
+   * Processes an inbound envelope. Returns true when the relay copy may be
+   * deleted: the message was committed, or it can never be processed (forged,
+   * malformed, not for us). Returns false to leave it at the relay, e.g. when
+   * the vault is locked or the local write failed.
    */
-  public handleInboundEnvelope(envelope: WireEnvelope, rawId: string): void {
-    if (!this.activeMask) return;
+  public handleInboundEnvelope(envelope: WireEnvelope, _rawId: string): boolean {
+    const mask = this.activeMask;
+    if (!mask || !isVaultOpen()) return false;
 
+    let payload: RatchetEncryptedPayload;
     let remoteDhPk: Uint8Array;
-    let nonce: Uint8Array;
-    let ciphertext: Uint8Array;
     try {
       remoteDhPk = fromB64(envelope.header.dhPk);
-      nonce = fromB64(envelope.nonce);
-      ciphertext = fromB64(envelope.ciphertext);
-    } catch {
-      return;
-    }
-
-    // 1. Identify contact via header.senderFp if present, or fallback to matching known contacts
-    const senderFp = envelope.header.senderFp;
-    let contact: Contact | null = null;
-    if (senderFp) {
-      contact = contactManager.getContactByFingerprint(senderFp);
-    }
-
-    if (!contact) {
-      const contacts = contactManager.listContacts();
-      contact =
-        contacts.find((c) => {
-          const state = this.ratchets.getOrLoadRatchet(`th_${c.id}`);
-          return (
-            c.dhPk.every((b, i) => b === remoteDhPk[i]) ||
-            (state?.remoteDhPk && state.remoteDhPk.every((b, i) => b === remoteDhPk[i]))
-          );
-        }) ?? null;
-    }
-
-    // If contact still unknown, create an auto-discovered contact record
-    if (!contact) {
-      const alias = senderFp ? `Peer ${senderFp.slice(0, 4)}` : `Peer ${envelope.header.dhPk.slice(0, 4)}`;
-      contact = contactManager.saveContact({
-        maskIndex: this.activeMask.index,
-        alias,
-        signPk: remoteDhPk,
-        dhPk: remoteDhPk,
-        verified: false,
-      });
-    }
-
-    const threadId = `th_${contact.id}`;
-    const effectiveSenderFp = senderFp ?? contact.fingerprint;
-    const conversationId = [effectiveSenderFp, this.activeMask.fingerprint].sort().join(':');
-
-    // Decrypt payload with Double Ratchet using symmetric conversationId
-    const pt = this.ratchets.decrypt(
-      threadId,
-      {
+      payload = {
         header: envelope.header,
-        nonce,
-        ciphertext,
-      },
-      effectiveSenderFp,
-      this.activeMask,
-      remoteDhPk,
-      conversationId,
-    );
-
-    if (!pt) {
-      // Discard unreadable or tampered envelope
-      return;
+        nonce: fromB64(envelope.nonce),
+        ciphertext: fromB64(envelope.ciphertext),
+      };
+    } catch {
+      return true;
     }
 
-    const bodyText = fromUtf8(pt);
+    const senderFp = envelope.header.senderFp;
+    if (!senderFp || remoteDhPk.length !== 32) return true;
+    if (!RETENTION_MODES.includes(envelope.header.retention)) return true;
 
-    // Store in Vault (persistent/timed) or RamVault (viewOnce)
-    const stored = insertMessage({
-      id: envelope.header.msgId || rawId,
+    const conversationId = conversationIdFor(senderFp, mask.fingerprint);
+    const known = contactManager.getContactByFingerprint(senderFp);
+
+    if (known && this.ratchets.getOrLoadRatchet(threadIdFor(known))) {
+      return this.receiveOnSession(known, payload, senderFp, mask, remoteDhPk, conversationId);
+    }
+    return this.receiveFirstContact(known, payload, senderFp, mask, remoteDhPk, conversationId);
+  }
+
+  private receiveOnSession(
+    contact: Contact,
+    payload: RatchetEncryptedPayload,
+    senderFp: string,
+    mask: MaskIdentity,
+    remoteDhPk: Uint8Array,
+    conversationId: string,
+  ): boolean {
+    const threadId = threadIdFor(contact);
+    let stored: StoredMessage | null = null;
+    try {
+      withTransaction(() => {
+        const pt = this.ratchets.decrypt(
+          threadId,
+          payload,
+          senderFp,
+          mask,
+          remoteDhPk,
+          conversationId,
+          false,
+        );
+        if (!pt) return;
+        const inner = decodeInner(pt);
+        wipe(pt);
+        if (!inner) return;
+        stored = this.storeInbound(threadId, payload, inner.body);
+      });
+    } catch {
+      // Roll the in-memory ratchet back to the last committed state.
+      this.ratchets.purge(threadId);
+      return false;
+    }
+    if (stored) this.notifyListeners(stored);
+    return true;
+  }
+
+  /**
+   * First message of a session. Only accepted if it carries an introduction
+   * signed by the initiator's identity key whose fingerprint matches the
+   * claimed sender. A first message can never be grafted onto an existing
+   * contact's established session.
+   */
+  private receiveFirstContact(
+    known: Contact | null,
+    payload: RatchetEncryptedPayload,
+    senderFp: string,
+    mask: MaskIdentity,
+    remoteDhPk: Uint8Array,
+    conversationId: string,
+  ): boolean {
+    const state = initBobSession(mask.dhSk, mask.dhPk, remoteDhPk);
+    const pt = ratchetDecryptMessage({ state, payload, threadId: conversationId, senderFp });
+    if (!pt) return true;
+    const inner = decodeInner(pt);
+    wipe(pt);
+    if (!inner?.intro) return true;
+
+    const introFp = verifyIntro(inner.intro, remoteDhPk, mask);
+    if (!introFp || introFp !== senderFp) return true;
+
+    const intro = inner.intro;
+    let threadId: string | null = null;
+    let stored: StoredMessage | null = null;
+    try {
+      withTransaction(() => {
+        const contact =
+          known ??
+          contactManager.saveContact({
+            maskIndex: mask.index,
+            alias: `Peer ${introFp.slice(0, 4)}`,
+            signPk: intro.ik,
+            dhPk: intro.xk,
+          });
+        threadId = threadIdFor(contact);
+        contactManager.ensureThread(contact);
+        this.ratchets.adoptSession(threadId, state);
+        stored = this.storeInbound(threadId, payload, inner.body);
+      });
+    } catch {
+      if (threadId) this.ratchets.purge(threadId);
+      return false;
+    }
+    if (stored) this.notifyListeners(stored);
+    return true;
+  }
+
+  private storeInbound(
+    threadId: string,
+    payload: RatchetEncryptedPayload,
+    body: string,
+  ): StoredMessage {
+    return insertMessage({
+      // Local IDs never come from the wire: a peer-chosen ID could collide
+      // with an existing row and make the insert fail (audit A-15).
+      id: newLocalId('m'),
       threadId,
       direction: 'in',
-      retention: envelope.header.retention,
-      body: bodyText,
-      ttlMs: envelope.header.ttlMs,
-      counter: envelope.header.n,
+      retention: payload.header.retention,
+      body,
+      ttlMs: payload.header.ttlMs,
+      counter: payload.header.n,
     });
-
-    this.notifyListeners(stored);
   }
 }
 

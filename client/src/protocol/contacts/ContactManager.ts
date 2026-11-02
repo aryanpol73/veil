@@ -18,6 +18,7 @@ import {
   getDb,
   saveContactRow,
   loadContactRow,
+  newLocalId,
   loadContactRowByFingerprint,
   listContactRows,
   updateContactVerification,
@@ -33,6 +34,8 @@ export interface CreateContactInput {
   dhPk: Uint8Array;
   verified?: boolean;
 }
+
+const VERIFICATION_STATES: VerificationState[] = ['UNVERIFIED', 'VERIFIED', 'CHANGED_IDENTITY'];
 
 export class ContactManager {
   /**
@@ -62,12 +65,20 @@ export class ContactManager {
   }
 
   /**
+   * Finds a contact by Ed25519 identity key. Contact rows are sealed, so this
+   * scans the (small) decrypted list rather than querying a plaintext column.
+   */
+  public getContactBySignPk(signPk: Uint8Array): Contact | null {
+    return this.listContacts().find((c) => timingSafeEqual(c.signPk, signPk)) ?? null;
+  }
+
+  /**
    * Creates or updates a contact. Detects key changes and triggers CHANGED_IDENTITY security event.
    */
   public saveContact(input: CreateContactInput): Contact {
     const now = Date.now();
     const fingerprint = computeFingerprint(input.signPk, input.dhPk);
-    const id = input.id ?? `ct_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const id = input.id ?? newLocalId('ct');
 
     // Check for existing contact by alias or ID to detect key substitution
     const existing = this.getContact(id);
@@ -99,6 +110,7 @@ export class ContactManager {
       fingerprint,
       verifiedAt,
       createdAt: existing?.createdAt ?? now,
+      verificationState: state,
     });
 
     return {
@@ -119,7 +131,7 @@ export class ContactManager {
    */
   public setVerificationState(id: string, state: VerificationState): void {
     const verifiedAt = state === 'VERIFIED' ? Date.now() : null;
-    updateContactVerification(id, verifiedAt);
+    updateContactVerification(id, verifiedAt, state);
   }
 
   /**
@@ -133,9 +145,14 @@ export class ContactManager {
     const db = getDb();
     const alias = customAlias ?? invite.nick ?? `Peer ${invite.fingerprint.slice(0, 4)}`;
 
+    // Re-importing a known identity must not fork it into a second contact.
+    // Same identity key + same exchange key: reuse. Same identity key + new
+    // exchange key: flag CHANGED_IDENTITY on the existing record (audit A-11).
+    const known = this.getContactBySignPk(invite.ik);
     const contact = this.saveContact({
+      id: known?.id,
       maskIndex,
-      alias,
+      alias: known?.alias ?? alias,
       signPk: invite.ik,
       dhPk: invite.xk,
       verified: false,
@@ -145,11 +162,15 @@ export class ContactManager {
     const now = Date.now();
 
     db.execute(
-      `INSERT OR REPLACE INTO threads
+      `INSERT OR IGNORE INTO threads
        (id, contact_id, default_retention, last_activity_at, unread_count)
        VALUES (?,?,?,?,?)`,
       [threadId, contact.id, 'persistent', now, 0],
     );
+    if (known && contact.verificationState === 'CHANGED_IDENTITY') {
+      // The old session was bound to the previous exchange key.
+      db.execute('DELETE FROM ratchets WHERE thread_id = ?', [threadId]);
+    }
 
     return {
       contact,
@@ -164,8 +185,24 @@ export class ContactManager {
     };
   }
 
+  /** Creates the contact's thread row if it does not exist yet. */
+  public ensureThread(contact: Contact): void {
+    getDb().execute(
+      `INSERT OR IGNORE INTO threads
+       (id, contact_id, default_retention, last_activity_at, unread_count)
+       VALUES (?,?,?,?,?)`,
+      [`th_${contact.id}`, contact.id, 'persistent', Date.now(), 0],
+    );
+  }
+
   private recordToContact(r: StoredContactRecord): Contact {
-    const state: VerificationState = r.verifiedAt ? 'VERIFIED' : 'UNVERIFIED';
+    const stored = r.verificationState as VerificationState | null | undefined;
+    const state: VerificationState =
+      stored && VERIFICATION_STATES.includes(stored)
+        ? stored
+        : r.verifiedAt
+          ? 'VERIFIED'
+          : 'UNVERIFIED';
 
     return {
       id: r.id,

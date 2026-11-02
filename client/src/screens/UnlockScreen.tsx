@@ -33,13 +33,14 @@ import {
 import PrismBackdrop from '../components/PrismBackdrop';
 import PrismSurface from '../components/PrismSurface';
 import CryptoLabel from '../components/CryptoLabel';
+import { unlockWithPin } from '../storage/db';
+import { beginSession, endSession } from '../session/SessionController';
 import {
-  unlockWithPin,
-  activeMaskIndex,
-  loadSealedMasterSeed,
-} from '../storage/db';
-import { identityManager } from '../identity/IdentityManager';
-import { messageService } from '../messaging/MessageService';
+  PIN_MAX_LENGTH,
+  PIN_MIN_LENGTH,
+  isValidPinLength,
+  sanitizePin,
+} from '../storage/pinPolicy';
 import type { RootNavigationProp } from '../types/navigation';
 
 export interface UnlockScreenProps {
@@ -52,11 +53,12 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
   const [error, setError] = useState<string | null>(null);
 
   const handleUnlock = async (enteredPin: string) => {
-    if (loading || enteredPin.length < 6) return;
+    if (loading || !isValidPinLength(enteredPin)) return;
     setLoading(true);
     setError(null);
 
     try {
+      await endSession();
       const res = await unlockWithPin(enteredPin);
       if (!res.ok) {
         if (Platform.OS !== 'web') {
@@ -66,7 +68,7 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
             /* ignore */
           }
         }
-        setError('AUTHENTICATION FAILED');
+        setError('INCORRECT PIN');
         setPin('');
         return;
       }
@@ -79,16 +81,16 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
         }
       }
 
-      // Load sealed master seed for this partition
-      const seed = loadSealedMasterSeed();
-      if (seed) {
-        const mask = identityManager.setIdentity(seed, activeMaskIndex());
-        messageService.setActiveMask(mask);
+      if (!beginSession()) {
+        await endSession();
+        setError('INCORRECT PIN');
+        setPin('');
+        return;
       }
 
       navigation.replace('ThreadList');
     } catch {
-      setError('AUTHENTICATION ERROR');
+      setError('INCORRECT PIN');
       setPin('');
     } finally {
       setLoading(false);
@@ -106,11 +108,15 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
       }
     }
 
-    const next = pin + num;
-    setPin(next);
-    if (next.length === 6) {
-      handleUnlock(next);
-    }
+    // No auto-submit: PINs may be any length in the policy range, so the
+    // user confirms explicitly with the submit key.
+    if (pin.length >= PIN_MAX_LENGTH) return;
+    setPin(pin + num);
+  };
+
+  const handleSubmit = () => {
+    if (loading || !isValidPinLength(pin)) return;
+    handleUnlock(pin);
   };
 
   const handleDelete = () => {
@@ -137,7 +143,7 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
               OBSIDIAN CRYPTOGRAPHIC LENS
             </CryptoLabel>
             <Text style={styles.subtitle}>
-              DUAL PARTITION VAULT ACCESS
+              ENTER PIN
             </Text>
           </View>
 
@@ -149,7 +155,7 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
               contentStyle={styles.dotRow}
               tint={withAlpha(Palette.voidTrench, 0.7)}
             >
-              {[0, 1, 2, 3, 4, 5].map((idx) => (
+              {Array.from({ length: Math.max(PIN_MIN_LENGTH, pin.length) }, (_, idx) => idx).map((idx) => (
                 <View
                   key={idx}
                   style={[
@@ -186,19 +192,20 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
               ['1', '2', '3'],
               ['4', '5', '6'],
               ['7', '8', '9'],
-              ['', '0', '⌫'],
+              ['✓', '0', '⌫'],
             ].map((row, rIdx) => (
               <View key={rIdx} style={styles.keypadRow}>
                 {row.map((btn, bIdx) => {
-                  if (btn === '') {
+                  const isDel = btn === '⌫';
+                  const isSubmit = btn === '✓';
+                  if (isSubmit && !isValidPinLength(pin)) {
                     return <View key={bIdx} style={styles.keyBtnEmpty} />;
                   }
-                  const isDel = btn === '⌫';
                   return (
                     <PrismSurface
                       key={bIdx}
                       interactive
-                      onPress={() => (isDel ? handleDelete() : handleKeyPress(btn))}
+                      onPress={() => (isDel ? handleDelete() : isSubmit ? handleSubmit() : handleKeyPress(btn))}
                       radius={Radius.bubble}
                       style={styles.keyBtn}
                       contentStyle={styles.keyBtnInner}
@@ -209,7 +216,7 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
                       }
                       active={isDel}
                       glowColor={isDel ? withAlpha(Palette.prismMagenta, 0.3) : undefined}
-                      accessibilityLabel={isDel ? 'Delete PIN digit' : `Digit ${btn}`}
+                      accessibilityLabel={isDel ? 'Delete PIN digit' : isSubmit ? 'Unlock' : `Digit ${btn}`}
                     >
                       <Text
                         style={[
@@ -226,27 +233,17 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({ navigation }) => {
             ))}
           </View>
 
-          {/* Coercion Notice */}
-          <View style={styles.footer}>
-            <Text style={styles.footerNote}>
-              Independent Master & Ghost PINs unlock separate partitions with zero forensic linkage.
-            </Text>
-          </View>
-
           {/* Hidden TextInput for accessibility / keyboard input */}
           <TextInput
             value={pin}
-            onChangeText={(val) => {
-              const digits = val.replace(/\D/g, '').slice(0, 6);
-              setPin(digits);
-              if (digits.length === 6) handleUnlock(digits);
-            }}
+            onChangeText={(val) => setPin(sanitizePin(val))}
+            onSubmitEditing={handleSubmit}
             keyboardType="numeric"
-            maxLength={6}
+            maxLength={PIN_MAX_LENGTH}
             secureTextEntry
             style={styles.hiddenInput}
             autoFocus={false}
-            accessibilityLabel="Enter 6-digit security PIN"
+            accessibilityLabel="Enter security PIN"
           />
         </View>
       </SafeAreaView>
@@ -352,18 +349,6 @@ const styles = StyleSheet.create({
     color: Palette.prismMagenta,
     fontSize: 20,
     lineHeight: 24,
-  },
-  footer: {
-    alignItems: 'center',
-    marginTop: Space.sm,
-  },
-  footerNote: {
-    fontFamily: 'monospace',
-    fontSize: 9.5,
-    lineHeight: 14,
-    color: Palette.textMuted,
-    textAlign: 'center',
-    letterSpacing: 0.5,
   },
   hiddenInput: {
     position: 'absolute',

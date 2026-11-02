@@ -18,6 +18,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   ListRenderItemInfo,
@@ -69,7 +70,6 @@ import {
 import DynamicWatermark from '../components/DynamicWatermark';
 import {
   RamVault,
-  insertMessage,
   listMessages,
   markReadAndArmTtl,
   getDb,
@@ -78,7 +78,13 @@ import {
 } from '../storage/db';
 import { contactManager } from '../protocol/contacts/ContactManager';
 import { identityManager } from '../identity/IdentityManager';
-import { messageService } from '../messaging/MessageService';
+import {
+  MAX_MESSAGE_BYTES,
+  MessageTooLargeError,
+  messageService,
+} from '../messaging/MessageService';
+
+const textEncoder = new TextEncoder();
 import type { ChatScreenRouteProp, RootNavigationProp } from '../types/navigation';
 
 type HapticType =
@@ -628,25 +634,28 @@ const Composer: React.FC<{
   ttlMs: number;
   onModeChange: (m: RetentionMode) => void;
   onTtlChange: (ms: number) => void;
-  onSend: (text: string) => void;
+  /** Resolves true once the message is accepted; the draft is kept otherwise. */
+  onSend: (text: string) => Promise<boolean>;
 }> = ({ mode, ttlMs, onModeChange, onTtlChange, onSend }) => {
   const insets = useSafeAreaInsets();
   const [text, setText] = useState('');
   const [focused, setFocused] = useState(false);
   const sendScale = useSharedValue(0);
 
-  const canSend = text.trim().length > 0;
+  const trimmed = text.trim();
+  const byteLength = useMemo(() => textEncoder.encode(trimmed).length, [trimmed]);
+  const tooLong = byteLength > MAX_MESSAGE_BYTES;
+  const canSend = trimmed.length > 0 && !tooLong;
 
   const sendStyle = useAnimatedStyle(() => ({
     transform: [{ scale: interpolate(sendScale.value, [0, 1], [1, 0.88]) }],
     opacity: canSend ? 1 : 0.35,
   }));
 
-  const submit = () => {
+  const submit = async () => {
     if (!canSend) return;
     haptic(mode === 'viewOnce' ? 'impactHeavy' : 'impactLight');
-    onSend(text.trim());
-    setText('');
+    if (await onSend(trimmed)) setText('');
   };
 
   return (
@@ -688,6 +697,12 @@ const Composer: React.FC<{
               </Pressable>
             ))}
           </View>
+        )}
+
+        {byteLength > MAX_MESSAGE_BYTES * 0.8 && (
+          <Text style={[Type.meta, tooLong && { color: Palette.prismMagenta }]}>
+            {`${byteLength} / ${MAX_MESSAGE_BYTES} bytes`}
+          </Text>
         )}
 
         <View style={[styles.inputRow, focused && Surface.activeEdge]}>
@@ -852,37 +867,32 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({
   /* ---- Actions --------------------------------------------------------- */
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (text: string): Promise<boolean> => {
       const activeMask = identityManager.getActiveMask();
-      if (contact && activeMask) {
-        try {
-          const msg = await messageService.sendMessage({
-            threadId: effectiveThreadId,
-            contact,
-            body: text,
-            retention: mode,
-            ttlMs: mode === 'timed' ? ttlMs : undefined,
-            senderFp: activeMask.fingerprint,
-          });
-          setMessages((prev) => [...prev, msg]);
-          requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
-          return;
-        } catch {
-          /* fallback */
-        }
+      if (!contact || !activeMask) return false;
+      try {
+        const msg = await messageService.sendMessage({
+          threadId: effectiveThreadId,
+          contact,
+          body: text,
+          retention: mode,
+          ttlMs: mode === 'timed' ? ttlMs : undefined,
+          senderFp: activeMask.fingerprint,
+        });
+        setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
+        requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
+        onTransmit?.(msg, mode === 'timed' ? ttlMs : undefined).catch(() => {});
+        return true;
+      } catch (err) {
+        // Nothing was stored; keep the draft so the user can retry or shorten it.
+        Alert.alert(
+          'Message not sent',
+          err instanceof MessageTooLargeError
+            ? `Messages are limited to ${MAX_MESSAGE_BYTES} bytes.`
+            : 'Something went wrong. Your message is still in the box.',
+        );
+        return false;
       }
-
-      const msg = insertMessage({
-        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-        threadId: effectiveThreadId,
-        direction: 'out',
-        retention: mode,
-        body: text,
-        ttlMs: mode === 'timed' ? ttlMs : undefined,
-      });
-      setMessages((prev) => [...prev, msg]);
-      requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
-      onTransmit?.(msg, mode === 'timed' ? ttlMs : undefined).catch(() => {});
     },
     [contact, effectiveThreadId, mode, ttlMs, onTransmit],
   );

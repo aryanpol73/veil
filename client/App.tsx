@@ -32,8 +32,8 @@ import { createStackNavigator } from '@react-navigation/stack';
 import * as ScreenCapture from 'expo-screen-capture';
 
 import { initCrypto } from './src/crypto/keys';
-import { isProvisioned, lockVault, RamVault } from './src/storage/db';
-import { identityManager } from './src/identity/IdentityManager';
+import { isProvisioned } from './src/storage/db';
+import { endSession } from './src/session/SessionController';
 import { Palette } from './src/theme/obsidianPrism';
 import type { RootStackParamList } from './src/types/navigation';
 
@@ -85,21 +85,18 @@ export default function App() {
     // 2. Mobile AppState lifecycle: auto-lock and secret key zeroization
     const handleAppStateChange = (nextState: AppStateStatus) => {
       if (nextState === 'background' || nextState === 'inactive') {
-        try {
-          lockVault().catch(() => {});
-          identityManager.lock();
-          RamVault.purgeAll();
-        } catch (err) {
-          console.error('[veil] lifecycle auto-lock error', err);
-        }
-
-        // Force navigation to Unlock screen if vault is provisioned
-        if (isProvisioned() && navigationRef.isReady()) {
-          navigationRef.reset({
-            index: 0,
-            routes: [{ name: 'Unlock' }],
+        // Navigate only after teardown completes, so the unlock screen never
+        // appears while keys or subscriptions are still live.
+        endSession()
+          .catch((err) => console.error('[veil] lifecycle auto-lock error', err))
+          .finally(() => {
+            if (isProvisioned() && navigationRef.isReady()) {
+              navigationRef.reset({
+                index: 0,
+                routes: [{ name: 'Unlock' }],
+              });
+            }
           });
-        }
       }
     };
 

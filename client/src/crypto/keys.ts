@@ -501,6 +501,25 @@ export const inboxWindow = (receivingRatchetPk: Uint8Array, now = Date.now()): s
 };
 
 /**
+ * Hours of past inboxes a client re-subscribes to on connect. Matches the
+ * relay's 24 h buffer TTL so mail sent while the recipient was offline for up
+ * to a full day is still claimed (audit A-08).
+ */
+export const INBOX_CATCHUP_HOURS = 24;
+
+/** Past `hoursBack` epochs, the current one, and the next (clock skew). */
+export const inboxCatchUpWindow = (
+  receivingRatchetPk: Uint8Array,
+  now = Date.now(),
+  hoursBack: number = INBOX_CATCHUP_HOURS,
+): string[] => {
+  const h = epochHour(now);
+  const out: string[] = [];
+  for (let e = h - hoursBack; e <= h + 1; e++) out.push(blindedInboxId(receivingRatchetPk, e));
+  return out;
+};
+
+/**
  * Inbox authorization token. Proves to the relay that the subscriber controls
  * the mask that owns this inbox, without naming an account. Bound to a
  * server-issued nonce so it cannot be replayed onto another connection.

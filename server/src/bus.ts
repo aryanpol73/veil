@@ -14,6 +14,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { randomBytes } from 'node:crypto';
 import { Redis } from 'ioredis';
 
 export interface RelayEnvelope {
@@ -37,29 +38,41 @@ export const CH_DELIVER = 'veil:relay:deliver';
 export const CH_ANNOUNCE = 'veil:relay:announce';
 
 /**
+ * Every bus message is tagged with the publishing node's random ID, and a
+ * node ignores its own tags. Without this, a node re-delivers every envelope
+ * it just fanned out locally. The ID is per-process and carries no meaning.
+ */
+const newNodeId = (): string => randomBytes(8).toString('hex');
+
+/**
  * Volatile in-memory bus for single-node development, unit testing, and memory-only deployments.
  */
 export class InMemoryRelayBus implements RelayBus {
   private emitter = new EventEmitter();
+  private readonly nodeId = newNodeId();
 
   constructor() {
     this.emitter.setMaxListeners(100);
   }
 
   async publishEnvelope(envelope: RelayEnvelope): Promise<void> {
-    this.emitter.emit(CH_DELIVER, envelope);
+    this.emitter.emit(CH_DELIVER, { origin: this.nodeId, envelope });
   }
 
   async announceInbox(inbox: string): Promise<void> {
-    this.emitter.emit(CH_ANNOUNCE, inbox);
+    this.emitter.emit(CH_ANNOUNCE, { origin: this.nodeId, inbox });
   }
 
   async subscribe(
     onEnvelope: (envelope: RelayEnvelope) => void,
     onAnnounce: (inbox: string) => void,
   ): Promise<void> {
-    this.emitter.on(CH_DELIVER, onEnvelope);
-    this.emitter.on(CH_ANNOUNCE, onAnnounce);
+    this.emitter.on(CH_DELIVER, (m: { origin: string; envelope: RelayEnvelope }) => {
+      if (m.origin !== this.nodeId) onEnvelope(m.envelope);
+    });
+    this.emitter.on(CH_ANNOUNCE, (m: { origin: string; inbox: string }) => {
+      if (m.origin !== this.nodeId) onAnnounce(m.inbox);
+    });
   }
 
   async close(): Promise<void> {
@@ -73,6 +86,7 @@ export class InMemoryRelayBus implements RelayBus {
 export class RedisRelayBus implements RelayBus {
   private pub: Redis;
   private sub: Redis;
+  private readonly nodeId = newNodeId();
 
   constructor(redisUrl: string) {
     this.pub = new Redis(redisUrl, { lazyConnect: true, enableOfflineQueue: false });
@@ -96,9 +110,10 @@ export class RedisRelayBus implements RelayBus {
     this.sub.on('message', (channel: string, raw: string) => {
       try {
         const msg = JSON.parse(raw);
-        if (channel === CH_DELIVER) {
-          onEnvelope(msg as RelayEnvelope);
-        } else if (channel === CH_ANNOUNCE) {
+        if (!msg || msg.origin === this.nodeId) return;
+        if (channel === CH_DELIVER && msg.envelope) {
+          onEnvelope(msg.envelope as RelayEnvelope);
+        } else if (channel === CH_ANNOUNCE && typeof msg.inbox === 'string') {
           onAnnounce(msg.inbox);
         }
       } catch {
@@ -109,7 +124,7 @@ export class RedisRelayBus implements RelayBus {
 
   async publishEnvelope(envelope: RelayEnvelope): Promise<void> {
     try {
-      await this.pub.publish(CH_DELIVER, JSON.stringify(envelope));
+      await this.pub.publish(CH_DELIVER, JSON.stringify({ origin: this.nodeId, envelope }));
     } catch {
       /* ignore transient publish drop */
     }
@@ -117,7 +132,7 @@ export class RedisRelayBus implements RelayBus {
 
   async announceInbox(inbox: string): Promise<void> {
     try {
-      await this.pub.publish(CH_ANNOUNCE, JSON.stringify({ inbox }));
+      await this.pub.publish(CH_ANNOUNCE, JSON.stringify({ origin: this.nodeId, inbox }));
     } catch {
       /* ignore transient publish drop */
     }

@@ -51,6 +51,7 @@ import {
   timingSafeEqual,
 } from '../crypto/keys';
 import { defaultDriver } from './sqliteDriver';
+import { PIN_MAX_LENGTH, PIN_MIN_LENGTH, isValidPinLength } from './pinPolicy';
 import type { RetentionMode } from '../theme/obsidianPrism';
 
 /* -------------------------------------------------------------------------- */
@@ -82,6 +83,18 @@ export interface SqlConnection {
 export interface SqlDriver {
   /** Opens (or creates) a database file. */
   open(name: string): SqlConnection;
+  /**
+   * True for drivers that must be backed by SQLCipher (native builds). Vault
+   * operations refuse to run if such a driver cannot prove encryption is
+   * active, instead of silently writing plaintext pages (audit A-13).
+   */
+  readonly requiresCipher?: boolean;
+}
+
+export class VaultEncryptionUnavailableError extends Error {
+  constructor() {
+    super('[veil/db] SQLCipher is not active in this build; refusing to open the vault.');
+  }
 }
 
 let driver: SqlDriver = defaultDriver;
@@ -129,9 +142,7 @@ async function loadOrCreateDeviceSalt(): Promise<Uint8Array> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * SQLite hardening pragmas.
- * Note: PRAGMA key and cipher_* pragmas are completely removed to prevent
- * silent no-op leaks on standard SQLite.
+ * SQLite hardening pragmas, applied after the SQLCipher key (see applyPragmas).
  */
 const PRAGMAS = [
   'PRAGMA secure_delete = ON',
@@ -166,7 +177,8 @@ CREATE TABLE IF NOT EXISTS contacts (
   fingerprint  TEXT NOT NULL,
   fp_tag       TEXT,
   verified_at  INTEGER,
-  created_at   INTEGER NOT NULL
+  created_at   INTEGER NOT NULL,
+  verification_state TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_contacts_fp_tag ON contacts(fp_tag);
@@ -257,21 +269,61 @@ export const getDb = (): SqlConnection => {
 export const getSession = (): VaultSession | null =>
   active ? { db: active.db, sessionId: active.sessionId } : null;
 
+export const isVaultOpen = (): boolean => active !== null;
+
+let txDepth = 0;
+
+/**
+ * Runs `fn` inside one SQLite transaction. Nested calls join the outer
+ * transaction instead of issuing a second BEGIN, so higher layers can group
+ * a ratchet update and a message insert into one atomic commit.
+ */
+export function withTransaction<T>(fn: () => T): T {
+  const db = getDb();
+  if (txDepth > 0) return fn();
+  let result!: T;
+  txDepth++;
+  try {
+    db.transaction(() => {
+      result = fn();
+    });
+  } finally {
+    txDepth--;
+  }
+  return result;
+}
+
+/** CSPRNG local record identifier. Never derived from wire input. */
+export const newLocalId = (prefix: string): string => `${prefix}_${toB64(randomBytes(16))}`;
+
 /* -------------------------------------------------------------------------- */
 /* Open / Canary / Migrate                                                    */
 /* -------------------------------------------------------------------------- */
 
 const CANARY_PLAINTEXT = utf8('veil.canary.v1');
 
+function assertCipherActive(conn: SqlConnection): void {
+  let version = '';
+  try {
+    const row = conn.execute<{ cipher_version?: string }>('PRAGMA cipher_version').rows?.[0];
+    version = String(row?.cipher_version ?? '');
+  } catch {
+    version = '';
+  }
+  // Stock SQLite accepts `PRAGMA key` as a silent no-op but has no
+  // cipher_version; an empty answer means pages would be written in clear.
+  if (!version) throw new VaultEncryptionUnavailableError();
+}
+
 function applyPragmas(conn: SqlConnection, rawKey?: Uint8Array): void {
   if (rawKey && rawKey.length > 0) {
-    try {
-      // Pass vault key directly to native SQLCipher codec engine when linked
+    if (driver.requiresCipher) {
+      assertCipherActive(conn);
+      // Raw 256-bit key: skips SQLCipher's own PBKDF2, Argon2id already ran.
       conn.execute(`PRAGMA key = "x'${toHex(rawKey)}'"`);
       conn.execute('PRAGMA cipher_page_size = 4096');
-    } catch {
-      /* ignore if running in-memory or standard SQLite without codec */
     }
+    // Non-cipher drivers (web preview, tests) rely on field-level AEAD only.
   }
   for (const p of PRAGMAS) conn.execute(p);
 }
@@ -378,6 +430,11 @@ function migrate(conn: SqlConnection): void {
     }
     try {
       conn.execute('ALTER TABLE ratchets ADD COLUMN skipped_keys TEXT');
+    } catch {
+      /* ignore if column exists */
+    }
+    try {
+      conn.execute('ALTER TABLE contacts ADD COLUMN verification_state TEXT');
     } catch {
       /* ignore if column exists */
     }
@@ -611,13 +668,25 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
   if (input.masterPin === input.ghostPin) {
     throw new Error('[veil/db] master and ghost PINs must differ.');
   }
-  if (input.masterPin.length < 6 || input.ghostPin.length < 6) {
-    throw new Error('[veil/db] PINs must be at least 6 characters.');
+  if (!isValidPinLength(input.masterPin) || !isValidPinLength(input.ghostPin)) {
+    throw new Error(`[veil/db] PINs must be ${PIN_MIN_LENGTH}-${PIN_MAX_LENGTH} characters.`);
   }
 
   const salt = await loadOrCreateDeviceSalt();
   const primaryKey = deriveVaultKey(input.masterPin, salt, PARTITION_LABEL.primary);
   const decoyKey = deriveVaultKey(input.ghostPin, salt, PARTITION_LABEL.decoy);
+  await writeVaults(input, primaryKey, decoyKey);
+}
+
+/**
+ * Writes both vault files under already-derived keys. Split out so panicWipe
+ * can provision a primary vault under a random key that no PIN derives.
+ */
+async function writeVaults(
+  input: Omit<ProvisionInput, 'masterPin' | 'ghostPin'>,
+  primaryKey: Uint8Array,
+  decoyKey: Uint8Array,
+): Promise<void> {
 
   const pSeed = input.primarySeed ?? randomBytes(CRYPTO.SEED_BYTES);
   const gSeed = input.ghostSeed ?? randomBytes(CRYPTO.SEED_BYTES);
@@ -750,6 +819,8 @@ export interface StoredContactRecord {
   fingerprint: string;
   verifiedAt: number | null;
   createdAt: number;
+  /** 'UNVERIFIED' | 'VERIFIED' | 'CHANGED_IDENTITY'; null on legacy rows. */
+  verificationState?: string | null;
 }
 
 export function computeContactFpTag(fingerprint: string, vaultKey?: Uint8Array): string {
@@ -775,8 +846,8 @@ export function saveContactRow(
 
   conn.execute(
     `INSERT OR REPLACE INTO contacts
-     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
+     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at, verification_state)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [
       contact.id,
       contact.maskIndex,
@@ -787,6 +858,7 @@ export function saveContactRow(
       fpTag,
       contact.verifiedAt,
       contact.createdAt,
+      contact.verificationState ?? null,
     ],
   );
 }
@@ -844,6 +916,7 @@ function parseContactRow(row: any, vaultKey: Uint8Array): StoredContactRecord | 
       fingerprint,
       verifiedAt: row.verified_at ?? null,
       createdAt: row.created_at,
+      verificationState: row.verification_state ?? null,
     };
   } catch {
     return null;
@@ -882,9 +955,17 @@ export function listContactRows(): StoredContactRecord[] {
   return contacts;
 }
 
-export function updateContactVerification(id: string, verifiedAt: number | null): void {
+export function updateContactVerification(
+  id: string,
+  verifiedAt: number | null,
+  verificationState: string,
+): void {
   if (!active) return;
-  getDb().execute('UPDATE contacts SET verified_at = ? WHERE id = ?', [verifiedAt, id]);
+  getDb().execute('UPDATE contacts SET verified_at = ?, verification_state = ? WHERE id = ?', [
+    verifiedAt,
+    verificationState,
+    id,
+  ]);
 }
 
 /**
@@ -1147,7 +1228,7 @@ export function insertMessage(input: InsertMessageInput): StoredMessage {
   const aad = utf8(`msg|${input.id}`);
   const sealedBody = packSealed(aeadEncrypt(active.vaultKey, utf8(input.body), aad));
 
-  db.transaction(() => {
+  withTransaction(() => {
     db.execute(
       `INSERT INTO messages
        (id, thread_id, direction, retention, body, created_at, expires_at, ttl_ms, counter)
@@ -1346,12 +1427,12 @@ export async function panicWipe(ghostPin: string, ghostFingerprint: string): Pro
     }
   }
   await Keychain.deleteItem(SALT_KEY);
-  await provisionVaults({
-    masterPin: toB64(randomBytes(24)), // unreachable by design
-    ghostPin,
-    primaryFingerprint: '0000 0000 0000 0000 0000',
-    ghostFingerprint,
-  });
+  const salt = await loadOrCreateDeviceSalt();
+  await writeVaults(
+    { primaryFingerprint: '0000 0000 0000 0000 0000', ghostFingerprint },
+    randomBytes(CRYPTO.VAULT_KEY_BYTES), // no PIN derives this key: unreachable by design
+    deriveVaultKey(ghostPin, salt, PARTITION_LABEL.decoy),
+  );
 }
 
 export default {

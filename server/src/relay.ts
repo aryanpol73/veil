@@ -57,6 +57,10 @@ const CONFIG = {
   bufferTtlMs: 24 * 3_600_000,
   maxQueueDepth: 256,
   maxQueuedInboxes: 200_000,
+  /** Global cap on buffered envelope bytes across all inboxes. */
+  maxBufferedBytes: 256 * 1024 * 1024,
+  /** Global cap on live first-claim registrations. */
+  maxClaims: 500_000,
 
   /** Per-connection limits. */
   maxSubsPerConn: 64,
@@ -122,6 +126,15 @@ const subscribers = new Map<string, Set<Conn>>();
 /** inbox -> first-claim owner key + expiry. RAM only, epoch-scoped. */
 const claims = new Map<string, { pk: Uint8Array; expiresAt: number }>();
 
+/** Running total of buffered `env` bytes, enforced against maxBufferedBytes. */
+let bufferedBytes = 0;
+
+/** Limits in force for the running server (CONFIG plus test overrides). */
+let limits: typeof CONFIG = CONFIG;
+
+const isInboxId = (v: unknown): v is string =>
+  typeof v === 'string' && v.length >= 16 && v.length <= 128 && /^[A-Za-z0-9_-]+$/.test(v);
+
 interface Conn {
   ws: WebSocket;
   /** Per-connection challenge; every SUB signature is bound to it. */
@@ -160,7 +173,7 @@ function authPreimage(inbox: string, nonce: Buffer): Uint8Array {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Redis pub/sub bus (fan-out only)                                          */
+/* Pub/sub bus (fan-out only)                                                 */
 /* -------------------------------------------------------------------------- */
 
 let bus: RelayBus;
@@ -175,17 +188,19 @@ let bus: RelayBus;
  *    for that inbox re-publishes it. That is how an offline client's mail
  *    reaches it after reconnecting to a different node — with zero persistence.
  */
-async function initBus(): Promise<void> {
-  bus = createRelayBus({ type: CONFIG.busType, redisUrl: CONFIG.redisUrl });
-  log.boot(`bus: ${CONFIG.busType}${CONFIG.busType === 'redis' ? ` (${CONFIG.redisUrl})` : ' (in-memory volatile)'}`);
+async function initBus(cfg: typeof CONFIG): Promise<void> {
+  bus = createRelayBus({ type: cfg.busType, redisUrl: cfg.redisUrl });
+  log.boot(`bus: ${cfg.busType}${cfg.busType === 'redis' ? ' (redis)' : ' (in-memory volatile)'}`);
 
+  // The bus drops this node's own publications, so a single node never
+  // re-delivers to itself.
   await bus.subscribe(
     (envelope: RelayEnvelope) => {
       // Only act if WE hold a subscriber; otherwise ignore entirely.
       if (subscribers.has(envelope.inbox)) fanOut(envelope as Envelope, false);
     },
     (inbox: string) => {
-      flushLocalBuffer(inbox);
+      if (isInboxId(inbox)) flushLocalBuffer(inbox);
     },
   );
 }
@@ -203,30 +218,45 @@ function send(conn: Conn, frame: ServerFrame): void {
   }
 }
 
-/** Pushes to local subscribers; buffers only if none and `allowBuffer`. */
-function fanOut(env: Envelope, allowBuffer: boolean): void {
+/**
+ * Pushes to local subscribers; buffers only if none and `allowBuffer`.
+ * Returns false if the envelope could not be held.
+ */
+function fanOut(env: Envelope, allowBuffer: boolean): boolean {
   const set = subscribers.get(env.inbox);
   if (set && set.size > 0) {
     for (const conn of set) {
       send(conn, { t: 'DELIVER', inbox: env.inbox, id: env.id, env: env.env });
     }
     // Held pending ACK so a socket that dies mid-flight does not lose mail.
-    buffer(env);
-    return;
+    return buffer(env);
   }
-  if (allowBuffer) buffer(env);
+  return allowBuffer ? buffer(env) : true;
 }
 
-function buffer(env: Envelope): void {
+/**
+ * Holds an envelope until ACK or expiry. Returns false when a limit is hit;
+ * the sender is then told DROPPED so it can retry. Nothing is ever evicted to
+ * make room, since silent eviction is undetectable data loss (audit A-14).
+ */
+function buffer(env: Envelope): boolean {
   let q = queues.get(env.inbox);
+  if (q?.some((e) => e.id === env.id)) return true; // idempotent across bus echoes
+  if (bufferedBytes + env.env.length > limits.maxBufferedBytes) return false;
+  if (q && q.length >= limits.maxQueueDepth) return false;
   if (!q) {
-    if (queues.size >= CONFIG.maxQueuedInboxes) return; // shed, never spill to disk
+    if (queues.size >= limits.maxQueuedInboxes) return false; // shed, never spill to disk
     q = [];
     queues.set(env.inbox, q);
   }
-  if (q.some((e) => e.id === env.id)) return; // idempotent across bus echoes
-  if (q.length >= CONFIG.maxQueueDepth) q.shift(); // oldest out; bounded RAM
   q.push(env);
+  bufferedBytes += env.env.length;
+  return true;
+}
+
+function releaseBytes(envs: Envelope[]): void {
+  for (const e of envs) bufferedBytes -= e.env.length;
+  if (bufferedBytes < 0) bufferedBytes = 0;
 }
 
 function flushLocalBuffer(inbox: string): void {
@@ -234,6 +264,11 @@ function flushLocalBuffer(inbox: string): void {
   if (!q || q.length === 0) return;
   const now = Date.now();
   const live = q.filter((e) => e.expiresAt > now);
+  releaseBytes(q.filter((e) => e.expiresAt <= now));
+  if (live.length === 0) {
+    queues.delete(inbox);
+    return;
+  }
   queues.set(inbox, live);
 
   const set = subscribers.get(inbox);
@@ -254,6 +289,7 @@ function dropAcked(inbox: string, ids: string[]): void {
   const q = queues.get(inbox);
   if (!q) return;
   const doomed = new Set(ids);
+  releaseBytes(q.filter((e) => doomed.has(e.id)));
   const remaining = q.filter((e) => !doomed.has(e.id));
   if (remaining.length === 0) queues.delete(inbox);
   else queues.set(inbox, remaining);
@@ -265,9 +301,10 @@ function dropAcked(inbox: string, ids: string[]): void {
 
 function allow(conn: Conn): boolean {
   const now = Date.now();
-  const elapsed = (now - conn.lastRefill) / 1000;
+  // Clamped: a clock step backwards must not drain the bucket.
+  const elapsed = Math.max(0, (now - conn.lastRefill) / 1000);
   conn.lastRefill = now;
-  conn.tokens = Math.min(CONFIG.rateBurst, conn.tokens + elapsed * CONFIG.ratePerSec);
+  conn.tokens = Math.min(limits.rateBurst, conn.tokens + elapsed * limits.ratePerSec);
   if (conn.tokens < 1) return false;
   conn.tokens -= 1;
   return true;
@@ -278,13 +315,21 @@ function allow(conn: Conn): boolean {
 /* -------------------------------------------------------------------------- */
 
 function handleSub(conn: Conn, f: Extract<ClientFrame, { t: 'SUB' }>): void {
-  if (conn.subs.size >= CONFIG.maxSubsPerConn) {
+  if (!isInboxId(f.inbox)) {
+    send(conn, { t: 'ERR', code: 'INBOX_FORM' });
+    return;
+  }
+  if (conn.subs.size >= limits.maxSubsPerConn && !conn.subs.has(f.inbox)) {
     send(conn, { t: 'DENIED', inbox: f.inbox });
     return;
   }
 
   let pk: Uint8Array;
   let sig: Uint8Array;
+  if (typeof f.pk !== 'string' || typeof f.sig !== 'string') {
+    send(conn, { t: 'DENIED', inbox: f.inbox });
+    return;
+  }
   try {
     pk = b64.dec(f.pk);
     sig = b64.dec(f.sig);
@@ -313,8 +358,11 @@ function handleSub(conn: Conn, f: Extract<ClientFrame, { t: 'SUB' }>): void {
       send(conn, { t: 'DENIED', inbox: f.inbox });
       return;
     }
+  } else if (claims.size >= limits.maxClaims) {
+    send(conn, { t: 'DENIED', inbox: f.inbox });
+    return;
   }
-  claims.set(f.inbox, { pk, expiresAt: now + CONFIG.claimTtlMs });
+  claims.set(f.inbox, { pk, expiresAt: now + limits.claimTtlMs });
 
   conn.subs.add(f.inbox);
   let set = subscribers.get(f.inbox);
@@ -334,12 +382,11 @@ function handleSub(conn: Conn, f: Extract<ClientFrame, { t: 'SUB' }>): void {
 function handleSend(conn: Conn, f: Extract<ClientFrame, { t: 'SEND' }>): void {
   // Enforce the fixed envelope size. Rejecting non-uniform payloads is what
   // makes padding actually protective — otherwise clients degrade it silently.
-  const size = Buffer.byteLength(f.env, 'base64');
-  if (size !== CONFIG.envelopeBytes) {
+  if (typeof f.env !== 'string' || Buffer.byteLength(f.env, 'base64') !== limits.envelopeBytes) {
     send(conn, { t: 'ERR', code: 'ENVELOPE_SIZE' });
     return;
   }
-  if (typeof f.inbox !== 'string' || f.inbox.length < 16 || f.inbox.length > 128) {
+  if (!isInboxId(f.inbox)) {
     send(conn, { t: 'ERR', code: 'INBOX_FORM' });
     return;
   }
@@ -349,10 +396,13 @@ function handleSend(conn: Conn, f: Extract<ClientFrame, { t: 'SEND' }>): void {
     id: randomBytes(12).toString('base64url'),
     inbox: f.inbox,
     env: f.env,
-    expiresAt: Date.now() + CONFIG.bufferTtlMs,
+    expiresAt: Date.now() + limits.bufferTtlMs,
   };
 
-  fanOut(envelope, true);
+  if (!fanOut(envelope, true)) {
+    send(conn, { t: 'DROPPED', inbox: f.inbox, reason: 'full' });
+    return;
+  }
   bus.publishEnvelope(envelope).catch(() => {});
   send(conn, { t: 'ACCEPTED', inbox: f.inbox, id: envelope.id });
 }
@@ -360,7 +410,7 @@ function handleSend(conn: Conn, f: Extract<ClientFrame, { t: 'SEND' }>): void {
 function handleFrame(conn: Conn, raw: RawData): void {
   conn.lastSeen = Date.now();
 
-  if (Buffer.byteLength(raw as Buffer) > CONFIG.maxFrameBytes) {
+  if (Buffer.byteLength(raw as Buffer) > limits.maxFrameBytes) {
     conn.ws.close(1009, 'frame');
     return;
   }
@@ -376,6 +426,10 @@ function handleFrame(conn: Conn, raw: RawData): void {
     send(conn, { t: 'ERR', code: 'PARSE' });
     return;
   }
+  if (!f || typeof f !== 'object' || typeof (f as { t?: unknown }).t !== 'string') {
+    send(conn, { t: 'ERR', code: 'PARSE' });
+    return;
+  }
 
   switch (f.t) {
     case 'HELLO':
@@ -383,13 +437,14 @@ function handleFrame(conn: Conn, raw: RawData): void {
         t: 'HELLO',
         v: 1,
         nonce: conn.nonce.toString('base64url'),
-        envelopeBytes: CONFIG.envelopeBytes,
+        envelopeBytes: limits.envelopeBytes,
       });
       break;
     case 'SUB':
       handleSub(conn, f);
       break;
     case 'UNSUB':
+      if (!isInboxId(f.inbox)) break;
       conn.subs.delete(f.inbox);
       subscribers.get(f.inbox)?.delete(conn);
       if (subscribers.get(f.inbox)?.size === 0) subscribers.delete(f.inbox);
@@ -398,7 +453,12 @@ function handleFrame(conn: Conn, raw: RawData): void {
       handleSend(conn, f);
       break;
     case 'ACK':
-      if (conn.subs.has(f.inbox) && Array.isArray(f.ids)) dropAcked(f.inbox, f.ids.slice(0, 256));
+      if (isInboxId(f.inbox) && conn.subs.has(f.inbox) && Array.isArray(f.ids)) {
+        dropAcked(
+          f.inbox,
+          f.ids.slice(0, 256).filter((id): id is string => typeof id === 'string'),
+        );
+      }
       break;
     case 'NOOP':
       // Client cover traffic. Accepted and discarded — its only purpose is to
@@ -430,9 +490,10 @@ export async function startRelayServer(
   configOverrides: Partial<typeof CONFIG> = {}
 ): Promise<RelayServerHandle> {
   const cfg = { ...CONFIG, ...configOverrides, port };
+  limits = cfg;
   await _sodium.ready;
   sodium = _sodium;
-  bus = createRelayBus({ type: cfg.busType, redisUrl: cfg.redisUrl });
+  await initBus(cfg);
 
   // No request logging middleware, deliberately. `/healthz` returns a bare 200
   // with no version string or counters — a fingerprintable banner is metadata.
@@ -523,6 +584,7 @@ export async function startRelayServer(
     const now = Date.now();
     for (const [inbox, q] of queues) {
       const live = q.filter((e) => e.expiresAt > now);
+      releaseBytes(q.filter((e) => e.expiresAt <= now));
       if (live.length === 0) queues.delete(inbox);
       else if (live.length !== q.length) queues.set(inbox, live);
     }
@@ -554,6 +616,7 @@ export async function startRelayServer(
       for (const e of q) e.env = '';
     }
     queues.clear();
+    bufferedBytes = 0;
     subscribers.clear();
     for (const c of claims.values()) c.pk.fill(0);
     claims.clear();

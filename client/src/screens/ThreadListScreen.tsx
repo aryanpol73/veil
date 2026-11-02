@@ -34,7 +34,9 @@ import MaskHeader from '../components/MaskHeader';
 import FingerprintDisplay from '../components/FingerprintDisplay';
 import EmptyState from '../components/EmptyState';
 import InviteModal from '../components/InviteModal';
-import { getDb, lockVault } from '../storage/db';
+import { getDb } from '../storage/db';
+import { endSession } from '../session/SessionController';
+import { ratchetManager } from '../messaging/RatchetManager';
 import { identityManager } from '../identity/IdentityManager';
 import { contactManager } from '../protocol/contacts/ContactManager';
 import { createInvite, type ParsedInvite } from '../crypto/keys';
@@ -96,8 +98,7 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
         /* ignore */
       }
     }
-    await lockVault();
-    identityManager.lock();
+    await endSession();
     navigation.replace('Unlock');
   };
 
@@ -121,6 +122,8 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
         parsedInvite,
         activeMask?.index ?? 0,
       );
+      // Re-importing a changed identity resets its session; drop any cached copy.
+      ratchetManager.purge(thread.id);
       setShowInviteModal(false);
       loadThreads();
       navigation.navigate('Chat', {
@@ -168,7 +171,7 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
           {/* Compact Identity Telemetry Header */}
           {activeMask && (
             <MaskHeader
-              maskLabel={activeMask.index === 0 ? 'PERSONAL' : 'GHOST'}
+              maskLabel="PERSONAL"
               fingerprint={activeMask.fingerprint}
               relayStatus={relayStatus}
               deviceFingerprint={identityManager.getDeviceFingerprint()}

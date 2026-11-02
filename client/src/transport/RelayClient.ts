@@ -27,7 +27,16 @@ export interface RelayClientConfig {
   sendTimeoutMs?: number;
 }
 
-export type DeliverCallback = (envelope: WireEnvelope, rawId: string) => void;
+/**
+ * Returns true once the envelope has been durably handled (decrypted and
+ * committed, or judged permanently unprocessable). Only then does the client
+ * ACK, which deletes the relay's copy. Returning false leaves the envelope at
+ * the relay for redelivery on the next subscription (audit A-15).
+ */
+export type DeliverCallback = (envelope: WireEnvelope, rawId: string) => boolean;
+
+/** Retry delay after the relay denies a subscription. */
+const DENIED_RETRY_MS = 30_000;
 
 interface PendingSend {
   resolve: (id: string) => void;
@@ -52,6 +61,7 @@ export class RelayClient {
   >();
 
   private pendingSends = new Map<string, PendingSend[]>();
+  private deniedRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
 
   constructor(config: RelayClientConfig = {}) {
@@ -60,6 +70,11 @@ export class RelayClient {
       (typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_RELAY_URL
         ? process.env.EXPO_PUBLIC_RELAY_URL
         : 'ws://127.0.0.1:8443');
+  }
+
+  /** Points the client at another relay. Takes effect on the next connect. */
+  public setUrl(url: string): void {
+    this.url = url;
   }
 
   public get currentStatus(): ConnectionStatus {
@@ -85,7 +100,8 @@ export class RelayClient {
   }
 
   public connect(): void {
-    if (this.isDisposed || this.ws) return;
+    if (this.ws) return;
+    this.isDisposed = false;
     this.setStatus('connecting');
 
     try {
@@ -118,11 +134,29 @@ export class RelayClient {
     }
   }
 
+  /**
+   * Tears down everything tied to the current vault session: subscriptions
+   * (which hold mask references), pending sends, timers and the socket. The
+   * client stays idle until the next connect()/subscribe(), so nothing is
+   * received or ACKed while the vault is locked (audit A-10).
+   */
   public disconnect(): void {
     this.isDisposed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    for (const t of this.deniedRetryTimers.values()) clearTimeout(t);
+    this.deniedRetryTimers.clear();
+    this.subscriptions.clear();
+    for (const queue of this.pendingSends.values()) {
+      for (const p of queue) {
+        clearTimeout(p.timer);
+        p.reject(new Error('[veil/transport] session closed'));
+      }
+    }
+    this.pendingSends.clear();
     this.stopHeartbeat();
     this.cleanupSocket();
+    this.reconnectPolicy.reset();
     this.setStatus('disconnected');
   }
 
@@ -185,7 +219,7 @@ export class RelayClient {
         break;
 
       case 'DENIED':
-        // Inbox subscription was denied by relay
+        this.scheduleDeniedRetry(frame.inbox);
         break;
 
       case 'DELIVER':
@@ -221,22 +255,36 @@ export class RelayClient {
   }
 
   private handleDeliver(inbox: string, id: string, envBase64: string): void {
-    // 1. Immediately ACK receipt to delete envelope from server RAM
-    this.sendFrame(RelayProtocol.createAck(inbox, [id]));
-
-    // 2. Decode envelope
-    const envelope = EnvelopeCodec.decode(envBase64);
-    if (!envelope) return;
-
-    // 3. Dispatch to inbox listener
+    // Not ours (any more): leave it at the relay.
     const sub = this.subscriptions.get(inbox);
-    if (sub) {
-      try {
-        sub.onDeliver(envelope, id);
-      } catch {
-        /* listener error */
-      }
+    if (!sub) return;
+
+    const envelope = EnvelopeCodec.decode(envBase64);
+    if (!envelope) {
+      // Malformed forever; drop it so it is not redelivered on every SUB.
+      this.sendFrame(RelayProtocol.createAck(inbox, [id]));
+      return;
     }
+
+    let handled = false;
+    try {
+      handled = sub.onDeliver(envelope, id) === true;
+    } catch {
+      handled = false;
+    }
+    if (handled) this.sendFrame(RelayProtocol.createAck(inbox, [id]));
+  }
+
+  private scheduleDeniedRetry(inbox: string): void {
+    if (!this.subscriptions.has(inbox) || this.deniedRetryTimers.has(inbox)) return;
+    const timer = setTimeout(() => {
+      this.deniedRetryTimers.delete(inbox);
+      const sub = this.subscriptions.get(inbox);
+      if (!sub || !this.serverNonce || this.status !== 'connected') return;
+      const auth = signInboxAuth(sub.mask, inbox, this.serverNonce);
+      this.sendFrame(RelayProtocol.createSub(inbox, auth.signPk, auth.signature));
+    }, DENIED_RETRY_MS);
+    this.deniedRetryTimers.set(inbox, timer);
   }
 
   private resubscribeAll(): void {
@@ -267,6 +315,9 @@ export class RelayClient {
 
   public unsubscribe(inbox: string): void {
     this.subscriptions.delete(inbox);
+    const retry = this.deniedRetryTimers.get(inbox);
+    if (retry) clearTimeout(retry);
+    this.deniedRetryTimers.delete(inbox);
     if (this.status === 'connected') {
       this.sendFrame(RelayProtocol.createUnsub(inbox));
     }

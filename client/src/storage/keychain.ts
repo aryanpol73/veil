@@ -4,9 +4,19 @@
  * ============================================================================
  *  Stores the device salt (and only the device salt). The master seed and PIN
  *  are never stored in the OS keystore.
- *  Provides a web/test safe in-memory fallback for web preview and unit tests.
+ *
+ *  On native builds every keystore failure throws. An in-memory fallback
+ *  there would hold the salt only until the process dies, after which both
+ *  vaults become permanently unopenable (audit A-13). The in-memory store is
+ *  used only on web preview and in Node tests, where no keystore exists.
  * ============================================================================
  */
+
+export class KeystoreUnavailableError extends Error {
+  constructor(op: string) {
+    super(`[veil/keychain] secure keystore ${op} failed`);
+  }
+}
 
 let SecureStore: any = null;
 let isNative = false;
@@ -33,7 +43,7 @@ export const Keychain = {
     try {
       return await SecureStore.getItemAsync(key);
     } catch {
-      return memoryStore.get(key) ?? null;
+      throw new KeystoreUnavailableError('read');
     }
   },
 
@@ -48,8 +58,16 @@ export const Keychain = {
         requireAuthentication: false,
       });
     } catch {
-      memoryStore.set(key, value);
+      throw new KeystoreUnavailableError('write');
     }
+    // Read back: a write that did not stick would lose the salt on restart.
+    let stored: string | null = null;
+    try {
+      stored = await SecureStore.getItemAsync(key);
+    } catch {
+      stored = null;
+    }
+    if (stored !== value) throw new KeystoreUnavailableError('verify');
   },
 
   async deleteItem(key: string): Promise<void> {
