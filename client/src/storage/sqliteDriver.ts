@@ -20,16 +20,15 @@ try {
  * Conforms strictly to the SqlDriver / SqlConnection / SqlResult interfaces in db.ts.
  */
 export const expoSqliteDriver: SqlDriver = {
+  // SQLCipher is a build-time switch (app.json expo-sqlite plugin
+  // `useSQLCipher: true`, then prebuild); there is no runtime open option.
+  // db.ts verifies it with `PRAGMA cipher_version` before keying.
+  requiresCipher: true,
   open(name: string): SqlConnection {
     if (!isNative || !SQLite) {
       return memoryDriver.open(name);
     }
-    let db: any;
-    try {
-      db = SQLite.openDatabaseSync(name, { useSQLCipher: true });
-    } catch {
-      db = SQLite.openDatabaseSync(name);
-    }
+    const db: any = SQLite.openDatabaseSync(name);
 
     return {
       execute<T = any>(sql: string, params: any[] = []): SqlResult<T> {
@@ -96,6 +95,8 @@ interface MemoryDbState {
   threads: Map<string, any>;
   ratchets: Map<string, any>;
   messages: Map<string, any>;
+  invites: Map<string, any>;
+  outbox: Map<string, any>;
   ballast: any[];
   pageCount: number;
 }
@@ -112,6 +113,8 @@ function getOrCreateMemoryDb(name: string): MemoryDbState {
       threads: new Map(),
       ratchets: new Map(),
       messages: new Map(),
+      invites: new Map(),
+      outbox: new Map(),
       ballast: [],
       pageCount: 16,
     };
@@ -195,6 +198,9 @@ export const memoryDriver: SqlDriver = {
             fp_tag: hasFpTag ? params[6] : undefined,
             verified_at: hasFpTag ? params[7] : params[6],
             created_at: hasFpTag ? params[8] : params[7],
+            verification_state: params[9] ?? null,
+            pair_secret: params[10] ?? null,
+            rendezvous: params[11] ?? null,
           });
           return { rows: [], rowsAffected: 1 };
         }
@@ -216,14 +222,95 @@ export const memoryDriver: SqlDriver = {
           return { rows: all as any, rowsAffected: 0 };
         }
 
-        if (/UPDATE\s+contacts\s+SET\s+verified_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
-          const c = mem.contacts.get(params[1]);
-          if (c) c.verified_at = params[0];
+        if (/UPDATE\s+contacts\s+SET\s+verified_at\s*=\s*\?,\s*verification_state\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const c = mem.contacts.get(params[2]);
+          if (c) {
+            c.verified_at = params[0];
+            c.verification_state = params[1];
+          }
           return { rows: [], rowsAffected: c ? 1 : 0 };
         }
 
+        if (/UPDATE\s+contacts\s+SET\s+pair_secret\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const c = mem.contacts.get(params[1]);
+          if (c) c.pair_secret = params[0];
+          return { rows: [], rowsAffected: c ? 1 : 0 };
+        }
+
+        // Outbox
+        if (/INSERT\s+INTO\s+outbox/i.test(trimmed)) {
+          mem.outbox.set(params[0], {
+            id: params[0],
+            thread_id: params[1],
+            contact_id: params[2],
+            inner: params[3],
+            attempts: params[4],
+            next_attempt_at: params[5],
+            created_at: params[6],
+          });
+          return { rows: [], rowsAffected: 1 };
+        }
+        if (/SELECT\s+\*\s+FROM\s+outbox\s+WHERE\s+next_attempt_at\s*<=\s*\?/i.test(trimmed)) {
+          const due = [...mem.outbox.values()]
+            .filter((o) => o.next_attempt_at <= params[0])
+            .sort((a, b) => a.created_at - b.created_at);
+          return { rows: due as any, rowsAffected: 0 };
+        }
+        if (/UPDATE\s+outbox\s+SET\s+attempts\s*=\s*\?,\s*next_attempt_at\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const o = mem.outbox.get(params[2]);
+          if (o) {
+            o.attempts = params[0];
+            o.next_attempt_at = params[1];
+          }
+          return { rows: [], rowsAffected: o ? 1 : 0 };
+        }
+        if (/DELETE\s+FROM\s+outbox\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          return { rows: [], rowsAffected: mem.outbox.delete(params[0]) ? 1 : 0 };
+        }
+
+        // Invites
+        if (/INSERT\s+INTO\s+invites/i.test(trimmed)) {
+          mem.invites.set(params[0], {
+            id: params[0],
+            rz: params[1],
+            auth_seed: params[2],
+            expires_at: params[3],
+            consumed_fp: params[4],
+            revoked: params[5],
+            created_at: params[6],
+          });
+          return { rows: [], rowsAffected: 1 };
+        }
+        if (/SELECT\s+\*\s+FROM\s+invites/i.test(trimmed)) {
+          const all = [...mem.invites.values()].sort((a, b) => b.created_at - a.created_at);
+          return { rows: all as any, rowsAffected: 0 };
+        }
+        if (/UPDATE\s+invites\s+SET\s+consumed_fp\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const inv = mem.invites.get(params[1]);
+          if (inv) inv.consumed_fp = params[0];
+          return { rows: [], rowsAffected: inv ? 1 : 0 };
+        }
+        if (/UPDATE\s+invites\s+SET\s+revoked\s*=\s*1\s+WHERE\s+id\s*=\s*\?/i.test(trimmed)) {
+          const inv = mem.invites.get(params[0]);
+          if (inv) inv.revoked = 1;
+          return { rows: [], rowsAffected: inv ? 1 : 0 };
+        }
+        if (/DELETE\s+FROM\s+invites\s+WHERE\s+expires_at\s*<\s*\?/i.test(trimmed)) {
+          let n = 0;
+          for (const [id, inv] of mem.invites) {
+            if (inv.expires_at < params[0]) {
+              mem.invites.delete(id);
+              n++;
+            }
+          }
+          return { rows: [], rowsAffected: n };
+        }
+
         // 7. threads table
-        if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+threads/i.test(trimmed)) {
+        if (/INSERT\s+(OR\s+(REPLACE|IGNORE)\s+)?INTO\s+threads/i.test(trimmed)) {
+          if (/IGNORE/i.test(trimmed) && mem.threads.has(params[0])) {
+            return { rows: [], rowsAffected: 0 };
+          }
           mem.threads.set(params[0], {
             id: params[0],
             contact_id: params[1],
@@ -265,6 +352,11 @@ export const memoryDriver: SqlDriver = {
         }
 
         // 8. ratchets table
+        if (/DELETE\s+FROM\s+ratchets\s+WHERE\s+thread_id\s*=\s*\?/i.test(trimmed)) {
+          const existed = mem.ratchets.delete(params[0]);
+          return { rows: [], rowsAffected: existed ? 1 : 0 };
+        }
+
         if (/INSERT\s+(OR\s+REPLACE\s+)?INTO\s+ratchets/i.test(trimmed)) {
           mem.ratchets.set(params[0], {
             thread_id: params[0],

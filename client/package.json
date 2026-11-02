@@ -4,13 +4,15 @@
   "main": "index.js",
   "dependencies": {
     "@expo/metro-runtime": "~57.0.15",
-    "@noble/ciphers": "^2.4.0",
-    "@noble/curves": "^2.4.0",
-    "@noble/hashes": "^2.4.0",
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
     "@react-navigation/native": "^7.3.18",
     "@react-navigation/stack": "^7.10.24",
     "expo": "~57.0.20",
     "expo-blur": "~57.0.2",
+    "expo-camera": "~57.0.6",
+    "expo-clipboard": "~57.0.2",
     "expo-haptics": "~57.0.3",
     "expo-linear-gradient": "~57.0.1",
     "expo-screen-capture": "~57.0.2",
@@ -25,7 +27,8 @@
     "react-native-reanimated": "4.5.1",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-svg": "15.15.4",
-    "react-native-web": "^0.21.2"
+    "react-native-web": "^0.21.2",
+    "toqr": "0.1.1"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

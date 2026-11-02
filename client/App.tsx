@@ -17,6 +17,7 @@ import {
   View,
   ActivityIndicator,
   AppState,
+  Linking,
   Platform,
   type AppStateStatus,
 } from 'react-native';
@@ -32,8 +33,9 @@ import { createStackNavigator } from '@react-navigation/stack';
 import * as ScreenCapture from 'expo-screen-capture';
 
 import { initCrypto } from './src/crypto/keys';
-import { isProvisioned, lockVault, RamVault } from './src/storage/db';
-import { identityManager } from './src/identity/IdentityManager';
+import { isProvisioned } from './src/storage/db';
+import { endSession } from './src/session/SessionController';
+import { setPendingInvite } from './src/session/pendingInvite';
 import { Palette } from './src/theme/obsidianPrism';
 import type { RootStackParamList } from './src/types/navigation';
 
@@ -41,6 +43,7 @@ import { UnlockScreen } from './src/screens/UnlockScreen';
 import { ProvisionScreen } from './src/screens/ProvisionScreen';
 import { ThreadListScreen } from './src/screens/ThreadListScreen';
 import { ChatScreen } from './src/screens/ChatScreen';
+import { VerifyScreen } from './src/screens/VerifyScreen';
 
 export const navigationRef = createNavigationContainerRef<RootStackParamList>();
 
@@ -85,29 +88,31 @@ export default function App() {
     // 2. Mobile AppState lifecycle: auto-lock and secret key zeroization
     const handleAppStateChange = (nextState: AppStateStatus) => {
       if (nextState === 'background' || nextState === 'inactive') {
-        try {
-          lockVault().catch(() => {});
-          identityManager.lock();
-          RamVault.purgeAll();
-        } catch (err) {
-          console.error('[veil] lifecycle auto-lock error', err);
-        }
-
-        // Force navigation to Unlock screen if vault is provisioned
-        if (isProvisioned() && navigationRef.isReady()) {
-          navigationRef.reset({
-            index: 0,
-            routes: [{ name: 'Unlock' }],
+        // Navigate only after teardown completes, so the unlock screen never
+        // appears while keys or subscriptions are still live.
+        endSession()
+          .catch((err) => console.error('[veil] lifecycle auto-lock error', err))
+          .finally(() => {
+            if (isProvisioned() && navigationRef.isReady()) {
+              navigationRef.reset({
+                index: 0,
+                routes: [{ name: 'Unlock' }],
+              });
+            }
           });
-        }
       }
     };
 
     const sub = AppState.addEventListener('change', handleAppStateChange);
 
+    // 3. veil://invite deep links: held in memory until a vault is open.
+    Linking.getInitialURL().then(setPendingInvite).catch(() => {});
+    const linkSub = Linking.addEventListener('url', ({ url }) => setPendingInvite(url));
+
     return () => {
       mounted = false;
       sub.remove();
+      linkSub.remove();
     };
   }, []);
 
@@ -137,6 +142,7 @@ export default function App() {
             <Stack.Screen name="Provision" component={ProvisionScreen} />
             <Stack.Screen name="ThreadList" component={ThreadListScreen} />
             <Stack.Screen name="Chat" component={ChatScreen} />
+            <Stack.Screen name="Verify" component={VerifyScreen} />
           </Stack.Navigator>
         </NavigationContainer>
       </SafeAreaProvider>

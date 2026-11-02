@@ -38,16 +38,18 @@ import FingerprintDisplay from '../components/FingerprintDisplay';
 import {
   generateMasterSeed,
   deriveMask,
+  destroyMask,
+  wipe,
 } from '../crypto/keys';
-import {
-  provisionVaults,
-  unlockWithPin,
-  activeMaskIndex,
-  loadSealedMasterSeed,
-} from '../storage/db';
-import { identityManager } from '../identity/IdentityManager';
-import { messageService } from '../messaging/MessageService';
+import { provisionVaults, unlockWithPin } from '../storage/db';
+import { beginSession } from '../session/SessionController';
 import type { RootNavigationProp } from '../types/navigation';
+import {
+  PIN_MAX_LENGTH,
+  PIN_MIN_LENGTH,
+  isValidPinLength,
+  sanitizePin,
+} from '../storage/pinPolicy';
 
 export interface ProvisionScreenProps {
   navigation: RootNavigationProp;
@@ -77,8 +79,8 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
     if (loading) return;
     setError(null);
 
-    if (masterPin.length < 6 || ghostPin.length < 6) {
-      setError('PINs must be at least 6 digits');
+    if (!isValidPinLength(masterPin) || !isValidPinLength(ghostPin)) {
+      setError(`PINs must be ${PIN_MIN_LENGTH}-${PIN_MAX_LENGTH} digits`);
       return;
     }
 
@@ -102,14 +104,14 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
         ghostSeed,
       });
 
+      // Setup secrets now live only in the sealed vaults.
+      wipe(primarySeed, ghostSeed);
+      destroyMask(primaryMask);
+      destroyMask(ghostMask);
+
       // Automatically unlock into primary vault
       const res = await unlockWithPin(masterPin);
-      if (res.ok) {
-        const seed = loadSealedMasterSeed();
-        if (seed) {
-          const mask = identityManager.setIdentity(seed, activeMaskIndex());
-          messageService.setActiveMask(mask);
-        }
+      if (res.ok && beginSession()) {
         navigation.replace('ThreadList');
       } else {
         navigation.replace('Unlock');
@@ -180,14 +182,14 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
               <PrismInput
                 value={masterPin}
                 onChangeText={(val) => {
-                  setMasterPin(val.replace(/\D/g, '').slice(0, 8));
+                  setMasterPin(sanitizePin(val));
                   setError(null);
                 }}
-                label="MASTER SECURITY PIN (MIN 6 DIGITS)"
-                placeholder="Enter 6-8 digit PIN"
+                label={`MASTER SECURITY PIN (${PIN_MIN_LENGTH}-${PIN_MAX_LENGTH} DIGITS)`}
+                placeholder={`Enter ${PIN_MIN_LENGTH}-${PIN_MAX_LENGTH} digit PIN`}
                 keyboardType="numeric"
                 secureTextEntry
-                maxLength={8}
+                maxLength={PIN_MAX_LENGTH}
                 mono
                 autoFocus
               />
@@ -220,14 +222,14 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
               <PrismInput
                 value={ghostPin}
                 onChangeText={(val) => {
-                  setGhostPin(val.replace(/\D/g, '').slice(0, 8));
+                  setGhostPin(sanitizePin(val));
                   setError(null);
                 }}
-                label="GHOST RECOVERY PIN (MUST BE DIFFERENT)"
-                placeholder="Enter distinct 6-8 digit PIN"
+                label="GHOST PIN (MUST BE DIFFERENT)"
+                placeholder={`Enter distinct ${PIN_MIN_LENGTH}-${PIN_MAX_LENGTH} digit PIN`}
                 keyboardType="numeric"
                 secureTextEntry
-                maxLength={8}
+                maxLength={PIN_MAX_LENGTH}
                 mono
               />
             </PrismSurface>
@@ -248,7 +250,7 @@ export const ProvisionScreen: React.FC<ProvisionScreenProps> = ({ navigation }) 
               variant="primary"
               size="lg"
               loading={loading}
-              disabled={loading || masterPin.length < 6 || ghostPin.length < 6}
+              disabled={loading || !isValidPinLength(masterPin) || !isValidPinLength(ghostPin)}
               onPress={handleProvision}
               style={styles.submitBtn}
             />

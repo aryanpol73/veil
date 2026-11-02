@@ -15,6 +15,9 @@ export type RootStackParamList = {
     threadId: string;
     contactId?: string;
   };
+  Verify: {
+    contactId: string;
+  };
 };
 
 export type RootNavigationProp = StackNavigationProp<RootStackParamList>;
@@ -23,3 +26,4 @@ export type ChatScreenRouteProp = RouteProp<RootStackParamList, 'Chat'>;
 export type ThreadListScreenRouteProp = RouteProp<RootStackParamList, 'ThreadList'>;
 export type UnlockScreenRouteProp = RouteProp<RootStackParamList, 'Unlock'>;
 export type ProvisionScreenRouteProp = RouteProp<RootStackParamList, 'Provision'>;
+export type VerifyScreenRouteProp = RouteProp<RootStackParamList, 'Verify'>;

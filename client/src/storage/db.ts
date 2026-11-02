@@ -51,6 +51,8 @@ import {
   timingSafeEqual,
 } from '../crypto/keys';
 import { defaultDriver } from './sqliteDriver';
+import { PIN_MAX_LENGTH, PIN_MIN_LENGTH, isValidPinLength } from './pinPolicy';
+import { readLimiter, recordAttempt, retryAfter } from './attemptLimiter';
 import type { RetentionMode } from '../theme/obsidianPrism';
 
 /* -------------------------------------------------------------------------- */
@@ -82,6 +84,18 @@ export interface SqlConnection {
 export interface SqlDriver {
   /** Opens (or creates) a database file. */
   open(name: string): SqlConnection;
+  /**
+   * True for drivers that must be backed by SQLCipher (native builds). Vault
+   * operations refuse to run if such a driver cannot prove encryption is
+   * active, instead of silently writing plaintext pages (audit A-13).
+   */
+  readonly requiresCipher?: boolean;
+}
+
+export class VaultEncryptionUnavailableError extends Error {
+  constructor() {
+    super('[veil/db] SQLCipher is not active in this build; refusing to open the vault.');
+  }
 }
 
 let driver: SqlDriver = defaultDriver;
@@ -129,9 +143,7 @@ async function loadOrCreateDeviceSalt(): Promise<Uint8Array> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * SQLite hardening pragmas.
- * Note: PRAGMA key and cipher_* pragmas are completely removed to prevent
- * silent no-op leaks on standard SQLite.
+ * SQLite hardening pragmas, applied after the SQLCipher key (see applyPragmas).
  */
 const PRAGMAS = [
   'PRAGMA secure_delete = ON',
@@ -166,6 +178,34 @@ CREATE TABLE IF NOT EXISTS contacts (
   fingerprint  TEXT NOT NULL,
   fp_tag       TEXT,
   verified_at  INTEGER,
+  created_at   INTEGER NOT NULL,
+  verification_state TEXT,
+  pair_secret  TEXT,
+  rendezvous   TEXT
+);
+
+-- Outgoing messages not yet accepted by a relay. "inner" is the sealed
+-- (vault-key AEAD) ratchet output; the relay envelope is rebuilt on every
+-- attempt so a late retry targets the recipient's current inbox.
+CREATE TABLE IF NOT EXISTS outbox (
+  id               TEXT PRIMARY KEY NOT NULL,
+  thread_id        TEXT NOT NULL,
+  contact_id       TEXT NOT NULL,
+  inner            TEXT NOT NULL,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at  INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL
+);
+
+-- Invites this vault issued. rz and auth_seed are sealed with AEAD. A row
+-- lives until 24 h after expiry so late first messages can still be claimed.
+CREATE TABLE IF NOT EXISTS invites (
+  id           TEXT PRIMARY KEY NOT NULL,
+  rz           TEXT NOT NULL,
+  auth_seed    TEXT NOT NULL,
+  expires_at   INTEGER NOT NULL,
+  consumed_fp  TEXT,
+  revoked      INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL
 );
 
@@ -257,21 +297,73 @@ export const getDb = (): SqlConnection => {
 export const getSession = (): VaultSession | null =>
   active ? { db: active.db, sessionId: active.sessionId } : null;
 
+export const isVaultOpen = (): boolean => active !== null;
+
+let txDepth = 0;
+
+/**
+ * Runs `fn` inside one SQLite transaction. Nested calls join the outer
+ * transaction instead of issuing a second BEGIN, so higher layers can group
+ * a ratchet update and a message insert into one atomic commit.
+ */
+export function withTransaction<T>(fn: () => T): T {
+  const db = getDb();
+  if (txDepth > 0) return fn();
+  let result!: T;
+  txDepth++;
+  try {
+    db.transaction(() => {
+      result = fn();
+    });
+  } finally {
+    txDepth--;
+  }
+  return result;
+}
+
+/** CSPRNG local record identifier. Never derived from wire input. */
+export const newLocalId = (prefix: string): string => `${prefix}_${toB64(randomBytes(16))}`;
+
 /* -------------------------------------------------------------------------- */
 /* Open / Canary / Migrate                                                    */
 /* -------------------------------------------------------------------------- */
 
 const CANARY_PLAINTEXT = utf8('veil.canary.v1');
 
+function assertCipherActive(conn: SqlConnection): void {
+  let version = '';
+  try {
+    const row = conn.execute<{ cipher_version?: string }>('PRAGMA cipher_version').rows?.[0];
+    version = String(row?.cipher_version ?? '');
+  } catch {
+    version = '';
+  }
+  // Stock SQLite accepts `PRAGMA key` as a silent no-op but has no
+  // cipher_version; an empty answer means pages would be written in clear.
+  if (!version) throw new VaultEncryptionUnavailableError();
+}
+
+/**
+ * The Argon2id output is a vault MASTER key and is never used directly.
+ * SQLCipher page encryption and field-level AEAD each get their own subkey,
+ * so the two ciphers never share key material (audit A-13).
+ */
+const cipherKeyOf = (vaultMaster: Uint8Array): Uint8Array =>
+  deriveSubSeed(vaultMaster, 'veil.vault.sqlcipher.v1');
+const fieldKeyOf = (vaultMaster: Uint8Array): Uint8Array =>
+  deriveSubSeed(vaultMaster, 'veil.vault.field.v1');
+
 function applyPragmas(conn: SqlConnection, rawKey?: Uint8Array): void {
   if (rawKey && rawKey.length > 0) {
-    try {
-      // Pass vault key directly to native SQLCipher codec engine when linked
-      conn.execute(`PRAGMA key = "x'${toHex(rawKey)}'"`);
+    if (driver.requiresCipher) {
+      assertCipherActive(conn);
+      // Raw 256-bit key: skips SQLCipher's own PBKDF2, Argon2id already ran.
+      const cipherKey = cipherKeyOf(rawKey);
+      conn.execute(`PRAGMA key = "x'${toHex(cipherKey)}'"`);
+      wipe(cipherKey);
       conn.execute('PRAGMA cipher_page_size = 4096');
-    } catch {
-      /* ignore if running in-memory or standard SQLite without codec */
     }
+    // Non-cipher drivers (web preview, tests) rely on field-level AEAD only.
   }
   for (const p of PRAGMAS) conn.execute(p);
 }
@@ -312,7 +404,9 @@ function tryOpen(partition: Partition, rawKey: Uint8Array): SqlConnection | null
     }
 
     const aad = utf8(PARTITION_LABEL[partition]);
-    const pt = aeadDecrypt(rawKey, sealed, aad);
+    const fieldKey = fieldKeyOf(rawKey);
+    const pt = aeadDecrypt(fieldKey, sealed, aad);
+    wipe(fieldKey);
     if (!pt) {
       try {
         conn.close();
@@ -380,6 +474,13 @@ function migrate(conn: SqlConnection): void {
       conn.execute('ALTER TABLE ratchets ADD COLUMN skipped_keys TEXT');
     } catch {
       /* ignore if column exists */
+    }
+    for (const column of ['verification_state', 'pair_secret', 'rendezvous']) {
+      try {
+        conn.execute(`ALTER TABLE contacts ADD COLUMN ${column} TEXT`);
+      } catch {
+        /* ignore if column exists */
+      }
     }
     conn.execute('INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)', ['schema_version', '1']);
   });
@@ -611,13 +712,27 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
   if (input.masterPin === input.ghostPin) {
     throw new Error('[veil/db] master and ghost PINs must differ.');
   }
-  if (input.masterPin.length < 6 || input.ghostPin.length < 6) {
-    throw new Error('[veil/db] PINs must be at least 6 characters.');
+  if (!isValidPinLength(input.masterPin) || !isValidPinLength(input.ghostPin)) {
+    throw new Error(`[veil/db] PINs must be ${PIN_MIN_LENGTH}-${PIN_MAX_LENGTH} characters.`);
   }
 
   const salt = await loadOrCreateDeviceSalt();
   const primaryKey = deriveVaultKey(input.masterPin, salt, PARTITION_LABEL.primary);
   const decoyKey = deriveVaultKey(input.ghostPin, salt, PARTITION_LABEL.decoy);
+  await writeVaults(input, primaryKey, decoyKey);
+}
+
+/**
+ * Writes both vault files under already-derived keys. Split out so panicWipe
+ * can provision a primary vault under a random key that no PIN derives.
+ */
+async function writeVaults(
+  input: Omit<ProvisionInput, 'masterPin' | 'ghostPin'>,
+  primaryKey: Uint8Array,
+  decoyKey: Uint8Array,
+): Promise<void> {
+  const primaryField = fieldKeyOf(primaryKey);
+  const decoyField = fieldKeyOf(decoyKey);
 
   const pSeed = input.primarySeed ?? randomBytes(CRYPTO.SEED_BYTES);
   const gSeed = input.ghostSeed ?? randomBytes(CRYPTO.SEED_BYTES);
@@ -629,17 +744,17 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
 
     // Sealed canary for primary
     const primaryCanary = packSealed(
-      aeadEncrypt(primaryKey, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.primary)),
+      aeadEncrypt(primaryField, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.primary)),
     );
     primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'canary',
       primaryCanary,
     ]);
     const sealedPrimaryFp = packSealed(
-      aeadEncrypt(primaryKey, utf8(input.primaryFingerprint), utf8('mask|0|fp')),
+      aeadEncrypt(primaryField, utf8(input.primaryFingerprint), utf8('mask|0|fp')),
     );
     const sealedPrimaryLabel = packSealed(
-      aeadEncrypt(primaryKey, utf8('Personal'), utf8('mask|0|label')),
+      aeadEncrypt(primaryField, utf8('Personal'), utf8('mask|0|label')),
     );
     primary.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
@@ -647,7 +762,7 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
     );
     primary.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'master_seed',
-      packSealed(aeadEncrypt(primaryKey, pSeed, utf8('master_seed'))),
+      packSealed(aeadEncrypt(primaryField, pSeed, utf8('master_seed'))),
     ]);
 
     const decoy = driver.open(FILES.decoy);
@@ -656,17 +771,17 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
 
     // Sealed canary for decoy
     const decoyCanary = packSealed(
-      aeadEncrypt(decoyKey, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.decoy)),
+      aeadEncrypt(decoyField, CANARY_PLAINTEXT, utf8(PARTITION_LABEL.decoy)),
     );
     decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'canary',
       decoyCanary,
     ]);
     const sealedGhostFp = packSealed(
-      aeadEncrypt(decoyKey, utf8(input.ghostFingerprint), utf8('mask|1|fp')),
+      aeadEncrypt(decoyField, utf8(input.ghostFingerprint), utf8('mask|1|fp')),
     );
     const sealedGhostLabel = packSealed(
-      aeadEncrypt(decoyKey, utf8('Personal'), utf8('mask|1|label')),
+      aeadEncrypt(decoyField, utf8('Personal'), utf8('mask|1|label')),
     );
     decoy.execute(
       'INSERT OR REPLACE INTO masks(mask_index, label, fingerprint, created_at) VALUES (?,?,?,?)',
@@ -674,17 +789,20 @@ export async function provisionVaults(input: ProvisionInput): Promise<void> {
     );
     decoy.execute('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)', [
       'master_seed',
-      packSealed(aeadEncrypt(decoyKey, gSeed, utf8('master_seed'))),
+      packSealed(aeadEncrypt(decoyField, gSeed, utf8('master_seed'))),
     ]);
 
-    seedDecoy(decoy, decoyKey);
+    // No seeded history. Content dated before the app's install time (which
+    // the OS shows) would itself be a tell, and a fixed seed is identical on
+    // every install (audit A-07). Both vaults start empty and identical; the
+    // decoy accrues real history the same way the primary does.
 
     // Equalize on-disk footprint, then close both together.
     padToward(primary, decoy);
     primary.close();
     decoy.close();
   } finally {
-    wipe(primaryKey, decoyKey);
+    wipe(primaryKey, decoyKey, primaryField, decoyField);
   }
 }
 
@@ -750,7 +868,29 @@ export interface StoredContactRecord {
   fingerprint: string;
   verifiedAt: number | null;
   createdAt: number;
+  /** 'UNVERIFIED' | 'VERIFIED' | 'CHANGED_IDENTITY'; null on legacy rows. */
+  verificationState?: string | null;
+  /** Wire v2 pair secret, set once a session exists (protocol/pairing.ts). */
+  pairSecret?: Uint8Array | null;
+  /** Invite `rz` used to reach this contact before the session is confirmed. */
+  rendezvous?: Uint8Array | null;
 }
+
+const sealOptional = (
+  key: Uint8Array,
+  bytes: Uint8Array | null | undefined,
+  aad: string,
+): string | null => (bytes ? packSealed(aeadEncrypt(key, bytes, utf8(aad))) : null);
+
+const openOptional = (
+  key: Uint8Array,
+  stored: unknown,
+  aad: string,
+): Uint8Array | null => {
+  if (typeof stored !== 'string') return null;
+  const sealed = unpackSealed(stored);
+  return sealed ? aeadDecrypt(key, sealed, utf8(aad)) : null;
+};
 
 export function computeContactFpTag(fingerprint: string, vaultKey?: Uint8Array): string {
   const key = vaultKey ?? active?.vaultKey;
@@ -775,8 +915,9 @@ export function saveContactRow(
 
   conn.execute(
     `INSERT OR REPLACE INTO contacts
-     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
+     (id, mask_index, alias, sign_pk, dh_pk, fingerprint, fp_tag, verified_at, created_at,
+      verification_state, pair_secret, rendezvous)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       contact.id,
       contact.maskIndex,
@@ -787,6 +928,9 @@ export function saveContactRow(
       fpTag,
       contact.verifiedAt,
       contact.createdAt,
+      contact.verificationState ?? null,
+      sealOptional(key, contact.pairSecret, `contact|${contact.id}|pair_secret`),
+      sealOptional(key, contact.rendezvous, `contact|${contact.id}|rendezvous`),
     ],
   );
 }
@@ -844,6 +988,9 @@ function parseContactRow(row: any, vaultKey: Uint8Array): StoredContactRecord | 
       fingerprint,
       verifiedAt: row.verified_at ?? null,
       createdAt: row.created_at,
+      verificationState: row.verification_state ?? null,
+      pairSecret: openOptional(vaultKey, row.pair_secret, `contact|${id}|pair_secret`),
+      rendezvous: openOptional(vaultKey, row.rendezvous, `contact|${id}|rendezvous`),
     };
   } catch {
     return null;
@@ -882,91 +1029,174 @@ export function listContactRows(): StoredContactRecord[] {
   return contacts;
 }
 
-export function updateContactVerification(id: string, verifiedAt: number | null): void {
+export function updateContactVerification(
+  id: string,
+  verifiedAt: number | null,
+  verificationState: string,
+): void {
   if (!active) return;
-  getDb().execute('UPDATE contacts SET verified_at = ? WHERE id = ?', [verifiedAt, id]);
+  getDb().execute('UPDATE contacts SET verified_at = ?, verification_state = ? WHERE id = ?', [
+    verifiedAt,
+    verificationState,
+    id,
+  ]);
 }
 
-/**
- * Seeds the decoy with neutral, boring, plausibly-aged content: a handful of
- * contacts and logistics chatter spread over the past few weeks. An empty
- * decoy is worse than no decoy — it reads as freshly manufactured.
- */
-function seedDecoy(conn: SqlConnection, vaultKey: Uint8Array): void {
+export function updateContactPairSecret(id: string, pairSecret: Uint8Array): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  getDb().execute('UPDATE contacts SET pair_secret = ? WHERE id = ?', [
+    sealOptional(active.vaultKey, pairSecret, `contact|${id}|pair_secret`),
+    id,
+  ]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Outbox                                                                     */
+/* -------------------------------------------------------------------------- */
+
+export interface OutboxItem {
+  id: string;
+  threadId: string;
+  contactId: string;
+  inner: Uint8Array;
+  attempts: number;
+  nextAttemptAt: number;
+  createdAt: number;
+}
+
+export function enqueueOutbox(item: { id: string; threadId: string; contactId: string; inner: Uint8Array }): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
   const now = Date.now();
-  const DAY = 86_400_000;
+  getDb().execute(
+    `INSERT INTO outbox (id, thread_id, contact_id, inner, attempts, next_attempt_at, created_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [
+      item.id,
+      item.threadId,
+      item.contactId,
+      sealOptional(active.vaultKey, item.inner, `outbox|${item.id}|inner`),
+      0,
+      now,
+      now,
+    ],
+  );
+}
 
-  const people: Array<[string, string]> = [
-    ['Dana R.', 'K7QP 4M2X 9WVE 3TNA 6HJD'],
-    ['Marco', 'B2XR 8T5K 1QMW 7NPV 4ZCE'],
-    ['Cycling Group', 'V9WM 3KQT 6XPB 2NER 8HAD'],
-    ['Aunt Lily', 'T4NC 7VPQ 2MKX 9WRB 5ZEH'],
-  ];
-
-  const chatter: Array<[number, 'in' | 'out', string, number]> = [
-    [0, 'in', 'are we still on for saturday?', 19 * DAY],
-    [0, 'out', 'yep — 10am at the usual place', 19 * DAY - 4e5],
-    [0, 'in', 'perfect, ill bring the thermos', 19 * DAY - 9e5],
-    [1, 'out', 'did you ever get that invoice sorted?', 12 * DAY],
-    [1, 'in', 'finally, yes. took three emails', 12 * DAY - 3e6],
-    [2, 'in', 'route change this week, meeting at the north gate', 6 * DAY],
-    [2, 'out', 'noted. weather looks fine', 6 * DAY - 6e5],
-    [3, 'in', 'the photos came out lovely, thank you', 2 * DAY],
-    [3, 'out', 'ill print a few and post them over', 2 * DAY - 1.2e6],
-    [0, 'in', 'running about 10 min late, sorry!', 4 * 3.6e6],
-  ];
-
-  conn.transaction(() => {
-    people.forEach(([alias, fp], i) => {
-      const contactId = `dc_${i}`;
-      const threadId = `dt_${i}`;
-      saveContactRow(
-        {
-          id: contactId,
-          maskIndex: 1,
-          alias,
-          signPk: randomBytes(32),
-          dhPk: randomBytes(32),
-          fingerprint: fp,
-          verifiedAt: i < 2 ? now - 20 * DAY : null,
-          createdAt: now - (30 - i * 4) * DAY,
-        },
-        vaultKey,
-        conn,
-      );
-      conn.execute(
-        `INSERT OR REPLACE INTO threads
-         (id, contact_id, default_retention, last_activity_at, unread_count)
-         VALUES (?,?,?,?,?)`,
-        [threadId, contactId, 'persistent', now - DAY, 0],
-      );
+/** Items whose next attempt is due, oldest first. */
+export function listDueOutbox(now: number = Date.now()): OutboxItem[] {
+  if (!active) return [];
+  const key = active.vaultKey;
+  const rows =
+    getDb().execute<any>('SELECT * FROM outbox WHERE next_attempt_at <= ? ORDER BY created_at ASC', [now])
+      .rows ?? [];
+  const out: OutboxItem[] = [];
+  for (const r of rows) {
+    const inner = openOptional(key, r.inner, `outbox|${r.id}|inner`);
+    if (!inner) continue;
+    out.push({
+      id: r.id,
+      threadId: r.thread_id,
+      contactId: r.contact_id,
+      inner,
+      attempts: r.attempts,
+      nextAttemptAt: r.next_attempt_at,
+      createdAt: r.created_at,
     });
+  }
+  return out;
+}
 
-    chatter.forEach(([threadIdx, direction, body, ago], i) => {
-      const msgId = `dm_${i}`;
-      const sealedBody = packSealed(
-        aeadEncrypt(vaultKey, utf8(body), utf8(`msg|${msgId}`)),
-      );
-      conn.execute(
-        `INSERT OR REPLACE INTO messages
-         (id, thread_id, direction, retention, body, created_at, delivered_at, read_at, counter)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
-        [
-          msgId,
-          `dt_${threadIdx}`,
-          direction,
-          'persistent',
-          sealedBody,
-          now - ago,
-          now - ago + 1500,
-          now - ago + 60_000,
-          i,
-        ],
-      );
+export function rescheduleOutbox(id: string, attempts: number, nextAttemptAt: number): void {
+  if (!active) return;
+  getDb().execute('UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE id = ?', [
+    attempts,
+    nextAttemptAt,
+    id,
+  ]);
+}
+
+export function deleteOutbox(id: string): void {
+  if (!active) return;
+  getDb().execute('DELETE FROM outbox WHERE id = ?', [id]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Invites issued by this vault                                               */
+/* -------------------------------------------------------------------------- */
+
+export interface StoredInvite {
+  id: string;
+  rz: Uint8Array;
+  authSeed: Uint8Array;
+  expiresAt: number;
+  consumedFp: string | null;
+  revoked: boolean;
+  createdAt: number;
+}
+
+/** How long after expiry an invite's rendezvous inbox is still watched. */
+export const INVITE_GRACE_MS = 24 * 3_600_000;
+
+export function saveInvite(invite: { id: string; rz: Uint8Array; authSeed: Uint8Array; expiresAt: number }): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  const key = active.vaultKey;
+  getDb().execute(
+    `INSERT INTO invites (id, rz, auth_seed, expires_at, consumed_fp, revoked, created_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [
+      invite.id,
+      sealOptional(key, invite.rz, `invite|${invite.id}|rz`),
+      sealOptional(key, invite.authSeed, `invite|${invite.id}|auth_seed`),
+      invite.expiresAt,
+      null,
+      0,
+      Date.now(),
+    ],
+  );
+}
+
+/** Invites whose rendezvous inbox should still be watched, newest first. */
+export function listLiveInvites(now: number = Date.now()): StoredInvite[] {
+  if (!active) return [];
+  const key = active.vaultKey;
+  const rows = getDb().execute<any>('SELECT * FROM invites ORDER BY created_at DESC').rows ?? [];
+  const out: StoredInvite[] = [];
+  for (const r of rows) {
+    if (r.revoked || r.expires_at + INVITE_GRACE_MS < now) continue;
+    const rz = openOptional(key, r.rz, `invite|${r.id}|rz`);
+    const authSeed = openOptional(key, r.auth_seed, `invite|${r.id}|auth_seed`);
+    if (!rz || !authSeed) continue;
+    const fp = openOptional(key, r.consumed_fp, `invite|${r.id}|consumed_fp`);
+    out.push({
+      id: r.id,
+      rz,
+      authSeed,
+      expiresAt: r.expires_at,
+      consumedFp: fp ? fromUtf8(fp) : null,
+      revoked: !!r.revoked,
+      createdAt: r.created_at,
     });
+  }
+  return out;
+}
 
-    conn.execute('UPDATE threads SET unread_count = 1 WHERE id = ?', ['dt_0']);
-  });
+export function markInviteConsumed(id: string, fingerprint: string): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  getDb().execute('UPDATE invites SET consumed_fp = ? WHERE id = ?', [
+    sealOptional(active.vaultKey, utf8(fingerprint), `invite|${id}|consumed_fp`),
+    id,
+  ]);
+}
+
+export function revokeInvite(id: string): void {
+  if (!active) throw new Error('[veil/db] vault is locked.');
+  getDb().execute('UPDATE invites SET revoked = 1 WHERE id = ?', [id]);
+}
+
+/** Drops invite rows past their grace period. */
+export function pruneInvites(now: number = Date.now()): void {
+  if (!active) return;
+  getDb().execute('DELETE FROM invites WHERE expires_at < ?', [now - INVITE_GRACE_MS]);
 }
 
 /**
@@ -994,7 +1224,10 @@ function padToward(a: SqlConnection, b: SqlConnection): void {
 /* Unlock                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export type UnlockResult = { ok: true; session: VaultSession } | { ok: false };
+export type UnlockResult =
+  | { ok: true; session: VaultSession }
+  /** `retryAfterMs` > 0 means the attempt limiter is holding further tries. */
+  | { ok: false; retryAfterMs: number };
 
 /**
  * The single entry point for PIN entry.
@@ -1007,6 +1240,17 @@ export type UnlockResult = { ok: true; session: VaultSession } | { ok: false };
 export async function unlockWithPin(pin: string): Promise<UnlockResult> {
   await lockVault();
 
+  // One device-wide limiter, outside both vaults (see attemptLimiter.ts).
+  const limiter = await readLimiter();
+  const wait = retryAfter(limiter);
+  if (wait > 0) return { ok: false, retryAfterMs: wait };
+
+  const session = await openWithPin(pin);
+  const next = await recordAttempt(limiter, session !== null);
+  return session ? { ok: true, session } : { ok: false, retryAfterMs: retryAfter(next) };
+}
+
+async function openWithPin(pin: string): Promise<VaultSession | null> {
   const salt = await loadOrCreateDeviceSalt();
 
   // Fixed, unconditional work: derive both candidates every single time.
@@ -1024,17 +1268,17 @@ export async function unlockWithPin(pin: string): Promise<UnlockResult> {
 
     if (p && !d) {
       opened = { conn: p, partition: 'primary' };
-      activeKey = new Uint8Array(primaryKey);
+      activeKey = fieldKeyOf(primaryKey);
     } else if (d && !p) {
       opened = { conn: d, partition: 'decoy' };
-      activeKey = new Uint8Array(decoyKey);
+      activeKey = fieldKeyOf(decoyKey);
     } else if (p && d) {
       // Collision / degenerate state (should never occur with distinct salts/labels)
       try { p.close(); } catch {}
       try { d.close(); } catch {}
-      return { ok: false };
+      return null;
     }
-    if (!opened || !activeKey) return { ok: false };
+    if (!opened || !activeKey) return null;
 
     migrate(opened.conn);
 
@@ -1049,7 +1293,7 @@ export async function unlockWithPin(pin: string): Promise<UnlockResult> {
     sweepExpired();
     startSweepTimer();
 
-    return { ok: true, session: { db: active.db, sessionId: active.sessionId } };
+    return { db: active.db, sessionId: active.sessionId };
   } finally {
     wipe(primaryKey, decoyKey);
   }
@@ -1147,7 +1391,7 @@ export function insertMessage(input: InsertMessageInput): StoredMessage {
   const aad = utf8(`msg|${input.id}`);
   const sealedBody = packSealed(aeadEncrypt(active.vaultKey, utf8(input.body), aad));
 
-  db.transaction(() => {
+  withTransaction(() => {
     db.execute(
       `INSERT INTO messages
        (id, thread_id, direction, retention, body, created_at, expires_at, ttl_ms, counter)
@@ -1346,12 +1590,12 @@ export async function panicWipe(ghostPin: string, ghostFingerprint: string): Pro
     }
   }
   await Keychain.deleteItem(SALT_KEY);
-  await provisionVaults({
-    masterPin: toB64(randomBytes(24)), // unreachable by design
-    ghostPin,
-    primaryFingerprint: '0000 0000 0000 0000 0000',
-    ghostFingerprint,
-  });
+  const salt = await loadOrCreateDeviceSalt();
+  await writeVaults(
+    { primaryFingerprint: '0000 0000 0000 0000 0000', ghostFingerprint },
+    randomBytes(CRYPTO.VAULT_KEY_BYTES), // no PIN derives this key: unreachable by design
+    deriveVaultKey(ghostPin, salt, PARTITION_LABEL.decoy),
+  );
 }
 
 export default {

@@ -1,0 +1,5 @@
+# No "log" directive: Caddy writes no access log, so client IPs and request
+# times are not recorded. Do not add one.
+{$VEIL_DOMAIN} {
+	reverse_proxy relay:8443
+}

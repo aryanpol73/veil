@@ -34,10 +34,14 @@ import MaskHeader from '../components/MaskHeader';
 import FingerprintDisplay from '../components/FingerprintDisplay';
 import EmptyState from '../components/EmptyState';
 import InviteModal from '../components/InviteModal';
-import { getDb, lockVault } from '../storage/db';
+import { getDb } from '../storage/db';
+import { endSession } from '../session/SessionController';
+import { onPendingInvite, takePendingInvite } from '../session/pendingInvite';
+import { ratchetManager } from '../messaging/RatchetManager';
 import { identityManager } from '../identity/IdentityManager';
 import { contactManager } from '../protocol/contacts/ContactManager';
-import { createInvite, type ParsedInvite } from '../crypto/keys';
+import { type ParsedInvite } from '../crypto/keys';
+import { messageService } from '../messaging/MessageService';
 import { relayClient, type ConnectionStatus } from '../transport/RelayClient';
 import type { Thread } from '../types/models';
 import type { RootNavigationProp } from '../types/navigation';
@@ -51,6 +55,19 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
   const [relayStatus, setRelayStatus] = useState<ConnectionStatus>('disconnected');
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [generatedInviteUri, setGeneratedInviteUri] = useState<string | null>(null);
+  const [incomingInvite, setIncomingInvite] = useState<string | null>(null);
+
+  // An invite link opened from another app: offer to pair with it.
+  useEffect(() => {
+    const check = () => {
+      const uri = takePendingInvite();
+      if (!uri) return;
+      setIncomingInvite(uri);
+      setShowInviteModal(true);
+    };
+    check();
+    return onPendingInvite(check);
+  }, []);
 
   const activeMask = identityManager.getActiveMask();
 
@@ -96,8 +113,7 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
         /* ignore */
       }
     }
-    await lockVault();
-    identityManager.lock();
+    await endSession();
     navigation.replace('Unlock');
   };
 
@@ -110,7 +126,7 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
         /* ignore */
       }
     }
-    const { uri } = createInvite(activeMask);
+    const { uri } = messageService.createInvite();
     setGeneratedInviteUri(uri);
     setShowInviteModal(true);
   };
@@ -121,6 +137,9 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
         parsedInvite,
         activeMask?.index ?? 0,
       );
+      // Re-importing a changed identity resets its session; drop any cached copy.
+      ratchetManager.purge(thread.id);
+      setIncomingInvite(null);
       setShowInviteModal(false);
       loadThreads();
       navigation.navigate('Chat', {
@@ -168,7 +187,7 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
           {/* Compact Identity Telemetry Header */}
           {activeMask && (
             <MaskHeader
-              maskLabel={activeMask.index === 0 ? 'PERSONAL' : 'GHOST'}
+              maskLabel="PERSONAL"
               fingerprint={activeMask.fingerprint}
               relayStatus={relayStatus}
               deviceFingerprint={identityManager.getDeviceFingerprint()}
@@ -258,7 +277,11 @@ export const ThreadListScreen: React.FC<ThreadListScreenProps> = ({ navigation }
           <InviteModal
             visible={showInviteModal}
             inviteUri={generatedInviteUri}
-            onClose={() => setShowInviteModal(false)}
+            onClose={() => {
+              setShowInviteModal(false);
+              setIncomingInvite(null);
+            }}
+            initialImport={incomingInvite}
             onPairSuccess={handlePairSuccess}
           />
         </View>

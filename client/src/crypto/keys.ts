@@ -350,6 +350,32 @@ export function computeFingerprint(signPk: Uint8Array, dhPk: Uint8Array): string
   return (crockford(digest).match(/.{1,4}/g) ?? []).join(' ');
 }
 
+/**
+ * Combined safety number for a pair of identities: 60 digits in 12 groups of
+ * five. Both sides compute the same value (inputs are sorted), and it binds
+ * both parties' identity AND exchange keys, so any substitution changes it.
+ * Users compare it in person or over a trusted call.
+ */
+export function safetyNumber(
+  a: { signPk: Uint8Array; dhPk: Uint8Array },
+  b: { signPk: Uint8Array; dhPk: Uint8Array },
+): string {
+  const blobA = concat(a.signPk, a.dhPk);
+  const blobB = concat(b.signPk, b.dhPk);
+  const [first, second] = toHex(blobA) < toHex(blobB) ? [blobA, blobB] : [blobB, blobA];
+  const digest = blake2b(concat(first, second), {
+    dkLen: 60,
+    key: utf8('veil.safety.v1'),
+  });
+  const groups: string[] = [];
+  for (let i = 0; i < 60; i += 5) {
+    let n = 0;
+    for (let j = 0; j < 5; j++) n = n * 256 + digest[i + j];
+    groups.push(String(n % 100_000).padStart(5, '0'));
+  }
+  return groups.join(' ');
+}
+
 /* -------------------------------------------------------------------------- */
 /* AEAD — XChaCha20-Poly1305                                                  */
 /* -------------------------------------------------------------------------- */
@@ -501,12 +527,31 @@ export const inboxWindow = (receivingRatchetPk: Uint8Array, now = Date.now()): s
 };
 
 /**
+ * Hours of past inboxes a client re-subscribes to on connect. Matches the
+ * relay's 24 h buffer TTL so mail sent while the recipient was offline for up
+ * to a full day is still claimed (audit A-08).
+ */
+export const INBOX_CATCHUP_HOURS = 24;
+
+/** Past `hoursBack` epochs, the current one, and the next (clock skew). */
+export const inboxCatchUpWindow = (
+  receivingRatchetPk: Uint8Array,
+  now = Date.now(),
+  hoursBack: number = INBOX_CATCHUP_HOURS,
+): string[] => {
+  const h = epochHour(now);
+  const out: string[] = [];
+  for (let e = h - hoursBack; e <= h + 1; e++) out.push(blindedInboxId(receivingRatchetPk, e));
+  return out;
+};
+
+/**
  * Inbox authorization token. Proves to the relay that the subscriber controls
  * the mask that owns this inbox, without naming an account. Bound to a
  * server-issued nonce so it cannot be replayed onto another connection.
  */
 export function signInboxAuth(
-  mask: MaskIdentity,
+  mask: Pick<MaskIdentity, 'signPk' | 'signSk'>,
   inboxId: string,
   serverNonce: Uint8Array,
 ): { signPk: string; signature: string } {
@@ -520,6 +565,13 @@ export function signInboxAuth(
 /* -------------------------------------------------------------------------- */
 /* Invitations — veil://invite?...                                            */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * First-contact inbox for an invite: B64U(BLAKE2b(key = rz, "veil.rz.inbox.v2")).
+ * See protocol/pairing.ts for the full wire v2 addressing scheme.
+ */
+export const rendezvousInboxId = (rz: Uint8Array): string =>
+  toB64(blake2b(utf8('veil.rz.inbox.v2'), { key: rz, dkLen: 32 }));
 
 export interface VeilInvite {
   v: 1;
@@ -623,12 +675,7 @@ export function parseInvite(uri: string): ParsedInvite | null {
     return {
       ...invite,
       fingerprint: computeFingerprint(invite.ik, invite.xk),
-      rendezvousInbox: blindedInboxId(
-        blake2b(invite.rz, {
-          dkLen: 32,
-          key: utf8(LBL.inbox).slice(0, 32),
-        }),
-      ),
+      rendezvousInbox: rendezvousInboxId(invite.rz),
     };
   } catch {
     return null;

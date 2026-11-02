@@ -26,6 +26,9 @@ import {
 } from '../theme/obsidianPrism';
 import SpecularGlass from './SpecularGlass';
 
+/** ISO/IEC 18004 quiet zone, in modules. */
+const QUIET_ZONE = 4;
+
 export interface QrInviteProps {
   value: string;
   size?: number;
@@ -88,21 +91,19 @@ export const QrInvite: React.FC<QrInviteProps> = ({
           <Svg
             width={innerSize}
             height={innerSize}
-            viewBox={`0 0 ${matrixSize} ${matrixSize}`}
+            viewBox={`${-QUIET_ZONE} ${-QUIET_ZONE} ${matrixSize + 2 * QUIET_ZONE} ${matrixSize + 2 * QUIET_ZONE}`}
           >
-            {/* Background plate */}
+            {/* Scanners expect dark modules on a light field with a quiet
+                zone; inverted or borderless codes fail on many cameras. */}
             <Rect
-              x={0}
-              y={0}
-              width={matrixSize}
-              height={matrixSize}
-              fill="transparent"
+              x={-QUIET_ZONE}
+              y={-QUIET_ZONE}
+              width={matrixSize + 2 * QUIET_ZONE}
+              height={matrixSize + 2 * QUIET_ZONE}
+              fill="#FFFFFF"
             />
             {/* Single batched path for all dark cells */}
-            <Path
-              d={pathData}
-              fill="#E0F7FA" // Soft ice-cyan high contrast
-            />
+            <Path d={pathData} fill="#04060A" />
           </Svg>
         ) : (
           <View style={{ width: innerSize, height: innerSize }} />

@@ -12,9 +12,9 @@
  * ============================================================================
  */
 
-import { fromB64, signInboxAuth, type MaskIdentity } from '../crypto/keys';
-import type { ServerFrame, WireEnvelope } from '../types/models';
-import { EnvelopeCodec } from './EnvelopeCodec';
+import { fromB64, signInboxAuth } from '../crypto/keys';
+import type { InboxSigner } from '../protocol/pairing';
+import type { ServerFrame } from '../types/models';
 import { ReconnectPolicy } from './ReconnectPolicy';
 import { RelayProtocol } from './RelayProtocol';
 
@@ -27,7 +27,22 @@ export interface RelayClientConfig {
   sendTimeoutMs?: number;
 }
 
-export type DeliverCallback = (envelope: WireEnvelope, rawId: string) => void;
+/**
+ * Returns true once the envelope has been durably handled (decrypted and
+ * committed, or judged permanently unprocessable). Only then does the client
+ * ACK, which deletes the relay's copy. Returning false leaves the envelope at
+ * the relay for redelivery on the next subscription (audit A-15).
+ */
+export type DeliverCallback = (envelopeB64: string, rawId: string) => boolean;
+
+/** Retry delay after the relay denies a subscription. */
+const DENIED_RETRY_MS = 30_000;
+
+/**
+ * SUB frames are paced below the relay's per-connection rate limit, so a
+ * catch-up burst (several inboxes per contact) is not answered with ERR RATE.
+ */
+const SUB_INTERVAL_MS = 60;
 
 interface PendingSend {
   resolve: (id: string) => void;
@@ -46,12 +61,12 @@ export class RelayClient {
   private noopTimer: ReturnType<typeof setInterval> | null = null;
   private isDisposed = false;
 
-  private subscriptions = new Map<
-    string,
-    { mask: MaskIdentity; onDeliver: DeliverCallback }
-  >();
+  private subscriptions = new Map<string, { signer: InboxSigner; onDeliver: DeliverCallback }>();
+  private subQueue = new Set<string>();
+  private subTimer: ReturnType<typeof setInterval> | null = null;
 
   private pendingSends = new Map<string, PendingSend[]>();
+  private deniedRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
 
   constructor(config: RelayClientConfig = {}) {
@@ -60,6 +75,11 @@ export class RelayClient {
       (typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_RELAY_URL
         ? process.env.EXPO_PUBLIC_RELAY_URL
         : 'ws://127.0.0.1:8443');
+  }
+
+  /** Points the client at another relay. Takes effect on the next connect. */
+  public setUrl(url: string): void {
+    this.url = url;
   }
 
   public get currentStatus(): ConnectionStatus {
@@ -85,7 +105,8 @@ export class RelayClient {
   }
 
   public connect(): void {
-    if (this.isDisposed || this.ws) return;
+    if (this.ws) return;
+    this.isDisposed = false;
     this.setStatus('connecting');
 
     try {
@@ -118,11 +139,30 @@ export class RelayClient {
     }
   }
 
+  /**
+   * Tears down everything tied to the current vault session: subscriptions
+   * (which hold mask references), pending sends, timers and the socket. The
+   * client stays idle until the next connect()/subscribe(), so nothing is
+   * received or ACKed while the vault is locked (audit A-10).
+   */
   public disconnect(): void {
     this.isDisposed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    for (const t of this.deniedRetryTimers.values()) clearTimeout(t);
+    this.deniedRetryTimers.clear();
+    this.subscriptions.clear();
+    this.stopSubQueue();
+    for (const queue of this.pendingSends.values()) {
+      for (const p of queue) {
+        clearTimeout(p.timer);
+        p.reject(new Error('[veil/transport] session closed'));
+      }
+    }
+    this.pendingSends.clear();
     this.stopHeartbeat();
     this.cleanupSocket();
+    this.reconnectPolicy.reset();
     this.setStatus('disconnected');
   }
 
@@ -185,7 +225,7 @@ export class RelayClient {
         break;
 
       case 'DENIED':
-        // Inbox subscription was denied by relay
+        this.scheduleDeniedRetry(frame.inbox);
         break;
 
       case 'DELIVER':
@@ -221,41 +261,79 @@ export class RelayClient {
   }
 
   private handleDeliver(inbox: string, id: string, envBase64: string): void {
-    // 1. Immediately ACK receipt to delete envelope from server RAM
-    this.sendFrame(RelayProtocol.createAck(inbox, [id]));
-
-    // 2. Decode envelope
-    const envelope = EnvelopeCodec.decode(envBase64);
-    if (!envelope) return;
-
-    // 3. Dispatch to inbox listener
+    // Not ours (any more): leave it at the relay.
     const sub = this.subscriptions.get(inbox);
-    if (sub) {
-      try {
-        sub.onDeliver(envelope, id);
-      } catch {
-        /* listener error */
-      }
+    if (!sub) return;
+
+    if (typeof envBase64 !== 'string') {
+      // Malformed forever; drop it so it is not redelivered on every SUB.
+      this.sendFrame(RelayProtocol.createAck(inbox, [id]));
+      return;
     }
+
+    let handled = false;
+    try {
+      handled = sub.onDeliver(envBase64, id) === true;
+    } catch {
+      handled = false;
+    }
+    if (handled) this.sendFrame(RelayProtocol.createAck(inbox, [id]));
+  }
+
+  private scheduleDeniedRetry(inbox: string): void {
+    if (!this.subscriptions.has(inbox) || this.deniedRetryTimers.has(inbox)) return;
+    const timer = setTimeout(() => {
+      this.deniedRetryTimers.delete(inbox);
+      this.queueSub(inbox);
+    }, DENIED_RETRY_MS);
+    this.deniedRetryTimers.set(inbox, timer);
   }
 
   private resubscribeAll(): void {
     if (!this.serverNonce || this.status !== 'connected') return;
-    for (const [inbox, { mask }] of this.subscriptions) {
-      const auth = signInboxAuth(mask, inbox, this.serverNonce);
-      this.sendFrame(RelayProtocol.createSub(inbox, auth.signPk, auth.signature));
-    }
+    for (const inbox of this.subscriptions.keys()) this.queueSub(inbox);
   }
 
-  public subscribe(
-    inbox: string,
-    mask: MaskIdentity,
-    onDeliver: DeliverCallback,
-  ): () => void {
-    this.subscriptions.set(inbox, { mask, onDeliver });
+  private queueSub(inbox: string): void {
+    if (!this.subscriptions.has(inbox)) return;
+    this.subQueue.add(inbox);
+    if (this.subTimer) return;
+    this.subTimer = setInterval(() => this.drainSubQueue(), SUB_INTERVAL_MS);
+    this.drainSubQueue();
+  }
+
+  private drainSubQueue(): void {
+    if (!this.serverNonce || this.status !== 'connected') {
+      this.stopSubQueue(false);
+      return;
+    }
+    const next = this.subQueue.values().next();
+    if (next.done) {
+      this.stopSubQueue(false);
+      return;
+    }
+    const inbox = next.value;
+    this.subQueue.delete(inbox);
+    const sub = this.subscriptions.get(inbox);
+    if (!sub) return;
+    const auth = signInboxAuth(sub.signer, inbox, this.serverNonce);
+    this.sendFrame(RelayProtocol.createSub(inbox, auth.signPk, auth.signature));
+  }
+
+  private stopSubQueue(clear = true): void {
+    if (this.subTimer) clearInterval(this.subTimer);
+    this.subTimer = null;
+    if (clear) this.subQueue.clear();
+  }
+
+  /**
+   * Subscribes to an inbox. `signer` is the inbox's own claim key (wire v2),
+   * never an identity key, so the relay cannot link inboxes to a person.
+   */
+  public subscribe(inbox: string, signer: InboxSigner, onDeliver: DeliverCallback): () => void {
+    this.subscriptions.set(inbox, { signer, onDeliver });
     if (this.status === 'connected' && this.serverNonce) {
-      const auth = signInboxAuth(mask, inbox, this.serverNonce);
-      this.sendFrame(RelayProtocol.createSub(inbox, auth.signPk, auth.signature));
+      this.queueSub(inbox);
     } else if (this.status === 'disconnected') {
       this.connect();
     }
@@ -267,6 +345,10 @@ export class RelayClient {
 
   public unsubscribe(inbox: string): void {
     this.subscriptions.delete(inbox);
+    this.subQueue.delete(inbox);
+    const retry = this.deniedRetryTimers.get(inbox);
+    if (retry) clearTimeout(retry);
+    this.deniedRetryTimers.delete(inbox);
     if (this.status === 'connected') {
       this.sendFrame(RelayProtocol.createUnsub(inbox));
     }

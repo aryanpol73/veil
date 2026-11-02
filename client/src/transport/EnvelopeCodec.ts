@@ -2,8 +2,10 @@
  * ============================================================================
  *  VEIL — ENVELOPE CODEC
  * ============================================================================
- *  Encodes and decodes versioned message envelopes into exactly 4,096-byte
- *  padded Base64 envelopes for transport across the blind relay.
+ *  LEGACY (wire v1). The JSON header and length prefix here are in CLEAR, so
+ *  the relay can read them (audit A-02). Production code uses
+ *  SealedEnvelope (wire v2); this codec remains only for the base64 helpers
+ *  and for older tests that exercise the relay with hand-built frames.
  * ============================================================================
  */
 
