@@ -331,15 +331,6 @@ Security engineering requires intellectual honesty. Veil is explicitly designed 
 
 ---
 
-## ✦ Security Disclosure
-
-If you identify a vulnerability or cryptographic weakness, please report it privately:
-
-- **Email:** `security@veil.network` (or open an encrypted issue)
-- Please provide reproducible steps and environment details. We follow a 90-day coordinated disclosure policy.
-
----
-
 <div align="center">
   <sub>Built for sovereign privacy. Dedicated to cryptographic freedom.</sub>
 </div>
